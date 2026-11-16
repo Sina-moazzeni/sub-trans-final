@@ -1,3 +1,5 @@
+import { backgroundSleep } from './backgroundKeepAlive';
+
 /**
  * Per-key sliding-window Requests-Per-Minute (RPM) rate limiter.
  * Serializes concurrent acquisitions on the same key via a lightweight mutex
@@ -12,25 +14,7 @@ const keyRequestTimestamps = new Map<string, number[]>();
 const keyMutexChains = new Map<string, Promise<void>>();
 
 function sleepAbortable(ms: number, signal?: AbortSignal): Promise<void> {
-  if (ms <= 0) return Promise.resolve();
-  if (signal?.aborted) {
-    return Promise.reject(new DOMException('Aborted', 'AbortError'));
-  }
-
-  return new Promise<void>((resolve, reject) => {
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const onAbort = () => {
-      if (timer) clearTimeout(timer);
-      reject(new DOMException('Aborted', 'AbortError'));
-    };
-
-    timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolve();
-    }, ms);
-
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
+  return backgroundSleep(ms, signal);
 }
 
 function pruneOldTimestamps(key: string, now: number): number[] {

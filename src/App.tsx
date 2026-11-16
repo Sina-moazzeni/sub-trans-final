@@ -79,6 +79,11 @@ import {
   saveStoredCustomProvider 
 } from './lib/apiKeyManager';
 import { acquireKeyRpmSlot } from './lib/keyRateLimiter';
+import {
+  backgroundSleep,
+  acquireTranslationKeepAlive,
+  updateTranslationTabTitle,
+} from './lib/backgroundKeepAlive';
 import { createSubtitlesBackupBlob, parseAndValidateBackupJson } from './lib/backupHelper';
 import { UILanguage, TRANSLATIONS } from './lib/i18n';
 import { SUBGAME_LAB_LOGO } from './assets/logo';
@@ -168,7 +173,9 @@ export default function App() {
     localStorage.setItem('gemini_ui_lang', uiLang);
     document.documentElement.dir = uiLang === 'en' ? 'ltr' : 'rtl';
     document.documentElement.lang = uiLang;
-    document.title = 'SubGame Lab | AI Subtitle & Game Translator';
+    if (!isTranslatingRef.current) {
+      document.title = 'SubGame Lab | AI Subtitle & Game Translator';
+    }
   }, [uiLang]);
 
   // File state
@@ -339,6 +346,61 @@ export default function App() {
   useEffect(() => {
     isPausedRef.current = isPaused;
   }, [isPaused]);
+
+  // Keep browser tab title synced with live translation progress so background progress is visible
+  useEffect(() => {
+    const activeTotal = progressTotalLines ?? items.length;
+    updateTranslationTabTitle(isTranslating, translatedCount, activeTotal);
+  }, [isTranslating, translatedCount, progressTotalLines, items.length]);
+
+  // Helper: fetch with per-request socket timeout (prevents silent half-open TCP stalls when browser/OS idles)
+  const fetchWithBackgroundTimeout = async (
+    url: string,
+    init: RequestInit,
+    userSignal: AbortSignal,
+    timeoutMs: number
+  ): Promise<Response> => {
+    const reqController = new AbortController();
+    const timerCancelController = new AbortController();
+    let timedOut = false;
+    let cancelled = false;
+
+    const onUserAbort = () => {
+      cancelled = true;
+      timerCancelController.abort();
+      reqController.abort();
+    };
+    if (userSignal.aborted) {
+      cancelled = true;
+      timerCancelController.abort();
+      reqController.abort();
+    } else {
+      userSignal.addEventListener('abort', onUserAbort, { once: true });
+    }
+
+    const timeoutAbortPromise = backgroundSleep(timeoutMs, timerCancelController.signal)
+      .then(() => {
+        if (!userSignal.aborted) {
+          timedOut = true;
+          reqController.abort();
+        }
+      })
+      .catch(() => {});
+
+    void timeoutAbortPromise;
+
+    try {
+      return await fetch(url, { ...init, signal: reqController.signal });
+    } catch (err: any) {
+      if (timedOut && !cancelled && !userSignal.aborted) {
+        throw new Error('Request socket timed out while waiting for server response.');
+      }
+      throw err;
+    } finally {
+      userSignal.removeEventListener('abort', onUserAbort);
+      timerCancelController.abort();
+    }
+  };
 
   // Toast Helper
   // FIX (L4): dedupe previously compared message text only, so two DIFFERENT events with the
@@ -1203,7 +1265,7 @@ export default function App() {
 
       while (isPausedRef.current) {
         if (isJobDead()) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await backgroundSleep(500);
       }
 
       if (isJobDead()) break;
@@ -1294,7 +1356,7 @@ export default function App() {
           // FIX (Cancellation): pause now works DURING streaming (backpressure) — previously the
           // pause flag was never checked inside the read loop, so pause did nothing until the batch ended
           while (isPausedRef.current && !isJobDead()) {
-            await new Promise((r) => setTimeout(r, 300));
+            await backgroundSleep(300);
           }
           if (isJobDead()) {
             clientGone = true;
@@ -1389,14 +1451,14 @@ export default function App() {
             if (isJobDead()) break;
             while (isPausedRef.current) {
               if (isJobDead()) break;
-              await new Promise((r) => setTimeout(r, 500));
+              await backgroundSleep(500);
             }
             setPacingRemainingSec(s);
-            await new Promise((r) => setTimeout(r, 1000));
+            await backgroundSleep(1000);
           }
           setPacingRemainingSec(null);
         } else {
-          await new Promise((resolve) => setTimeout(resolve, 600));
+          await backgroundSleep(600);
         }
       }
     }
@@ -1456,6 +1518,8 @@ export default function App() {
     const currentJobId = 'job_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
     activeJobIdRef.current = currentJobId;
 
+    const releaseKeepAlive = acquireTranslationKeepAlive();
+
     isTranslatingRef.current = true;
     setIsTranslating(true);
     setIsPaused(false);
@@ -1464,22 +1528,23 @@ export default function App() {
     setIsFallbackActive(false);
     setPacingRemainingSec(null);
 
-    // If live streaming model is selected, use real-time stream engine (Gemini only)
-    if (selectedModel === 'gemini-live-stream') {
-      if (activeAiProvider === 'custom') {
-        showToast(
-          uiLang === 'en'
-            ? 'Gemini Live Stream is only supported on Google Gemini. Translating with Custom Provider in standard mode.'
-            : 'حالت پخش زنده مخصوص گوگل جمینای است. ترجمه با سرویس‌دهنده سفارشی در حالت استاندارد انجام می‌شود.',
-          'info'
-        );
-      } else {
-        await translateWithLiveStream(currentJobId);
-        return;
+    try {
+      // If live streaming model is selected, use real-time stream engine (Gemini only)
+      if (selectedModel === 'gemini-live-stream') {
+        if (activeAiProvider === 'custom') {
+          showToast(
+            uiLang === 'en'
+              ? 'Gemini Live Stream is only supported on Google Gemini. Translating with Custom Provider in standard mode.'
+              : 'حالت پخش زنده مخصوص گوگل جمینای است. ترجمه با سرویس‌دهنده سفارشی در حالت استاندارد انجام می‌شود.',
+            'info'
+          );
+        } else {
+          await translateWithLiveStream(currentJobId);
+          return;
+        }
       }
-    }
 
-    const BATCH_SIZE = batchSize || 35;
+      const BATCH_SIZE = batchSize || 35;
     const totalCount = items.length;
     const totalBatchesCount = Math.ceil(totalCount / BATCH_SIZE);
 
@@ -1495,7 +1560,7 @@ export default function App() {
       // Handle pause loop
       while (isPausedRef.current) {
         if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        await backgroundSleep(500);
       }
 
       if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
@@ -1542,14 +1607,14 @@ export default function App() {
 
       let success = false;
       let attempt = 0;
-      const MAX_RETRIES = 3; // Consolidated unified retries (Requirements 6, 7, 8)
+      const MAX_RETRIES = 5;
 
       while (!success && attempt < MAX_RETRIES && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
         attempt++;
         if (attempt > 1) {
           setRetryInfo({ batch: b + 1, attempt, maxRetries: MAX_RETRIES });
-          // Exponential backoff with jitter
-          const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 16000);
+          // Exponential backoff with jitter (Web Worker timer - immune to background tab clamping)
+          const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 20000);
           const jitter = Math.floor(Math.random() * 1000);
           const backoffDelay = baseDelay + jitter;
           showToast(
@@ -1560,7 +1625,7 @@ export default function App() {
               : `تلاش مجدد دسته ${b + 1} (تلاش ${attempt} از ${MAX_RETRIES}) تا ${(backoffDelay / 1000).toFixed(1)} ثانیه دیگر...`,
             'warning'
           );
-          await new Promise((resolve) => setTimeout(resolve, backoffDelay));
+          await backgroundSleep(backoffDelay);
         }
 
         if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
@@ -1592,28 +1657,33 @@ export default function App() {
 
           if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
 
-          const response = await fetch('/api/translate', {
-            method: 'POST',
-            headers: getApiHeaders(orderedKeyStrings),
-            body: JSON.stringify({
-              jobId: currentJobId,
-              items: itemsToTranslate.map((i) => ({ 
-                id: i.id, 
-                text: i.originalText,
-                key: i.gameKey,
-                context: i.context 
-              })),
-              sourceLanguage: sourceLanguage === 'auto' ? undefined : sourceLanguage,
-              targetLanguage,
-              tone: selectedTone,
-              customPrompt,
-              mode,
-              model: effectiveModel,
-              provider: activeAiProvider,
-              customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
-            }),
-            signal: abortController.signal,
-          });
+          const reqTimeoutMs = activeAiProvider === 'custom' ? 260_000 : 180_000;
+          const response = await fetchWithBackgroundTimeout(
+            '/api/translate',
+            {
+              method: 'POST',
+              headers: getApiHeaders(orderedKeyStrings),
+              body: JSON.stringify({
+                jobId: currentJobId,
+                items: itemsToTranslate.map((i) => ({ 
+                  id: i.id, 
+                  text: i.originalText,
+                  key: i.gameKey,
+                  context: i.context 
+                })),
+                sourceLanguage: sourceLanguage === 'auto' ? undefined : sourceLanguage,
+                targetLanguage,
+                tone: selectedTone,
+                customPrompt,
+                mode,
+                model: effectiveModel,
+                provider: activeAiProvider,
+                customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
+              }),
+            },
+            abortController.signal,
+            reqTimeoutMs
+          );
 
           // Verify job isolation: if cancelled or job changed, discard response immediately (Requirement 10)
           if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) {
@@ -1699,14 +1769,14 @@ export default function App() {
             if (cancelTranslationRef.current) break;
             while (isPausedRef.current) {
               if (cancelTranslationRef.current) break;
-              await new Promise((r) => setTimeout(r, 500));
+              await backgroundSleep(500);
             }
             setPacingRemainingSec(s);
-            await new Promise((r) => setTimeout(r, 1000));
+            await backgroundSleep(1000);
           }
           setPacingRemainingSec(null);
         } else {
-          await new Promise((resolve) => setTimeout(resolve, 1000));
+          await backgroundSleep(1000);
         }
       }
     }
@@ -1721,6 +1791,9 @@ export default function App() {
       if (!cancelTranslationRef.current) {
         showToast(t.translationFinished, 'success');
       }
+    }
+    } finally {
+      releaseKeepAlive();
     }
   };
 
@@ -2440,6 +2513,8 @@ export default function App() {
     const currentJobId = 'job_conc_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 7);
     activeJobIdRef.current = currentJobId;
 
+    const releaseKeepAlive = acquireTranslationKeepAlive();
+
     folderAbortControllersRef.current.forEach((ctrl) => {
       try { ctrl.abort(); } catch {}
     });
@@ -2537,7 +2612,7 @@ export default function App() {
 
           while (isPausedRef.current) {
             if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
-            await new Promise((resolve) => setTimeout(resolve, 400));
+            await backgroundSleep(400);
           }
 
           if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
@@ -2579,15 +2654,15 @@ export default function App() {
 
           let success = false;
           let attempt = 0;
-          const MAX_RETRIES = 4;
+          const MAX_RETRIES = 5;
 
           while (!success && attempt < MAX_RETRIES && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
             attempt++;
             if (attempt > 1) {
               setRetryInfo({ batch: batchNum, attempt, maxRetries: MAX_RETRIES });
-              const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 16000);
+              const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 20000);
               const jitter = Math.floor(Math.random() * 1000);
-              await new Promise((resolve) => setTimeout(resolve, baseDelay + jitter));
+              await backgroundSleep(baseDelay + jitter);
             }
 
             if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
@@ -2621,28 +2696,33 @@ export default function App() {
 
               if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
 
-              const response = await fetch('/api/translate', {
-                method: 'POST',
-                headers: getApiHeaders(orderedKeyStrings),
-                body: JSON.stringify({
-                  jobId: currentJobId,
-                  items: itemsToTranslate.map((i) => ({
-                    id: i.id,
-                    text: i.originalText,
-                    key: i.gameKey,
-                    context: i.context,
-                  })),
-                  sourceLanguage: sourceLanguage === 'auto' ? undefined : sourceLanguage,
-                  targetLanguage,
-                  tone: selectedTone,
-                  customPrompt,
-                  mode: 'cinema',
-                  model: effectiveModel,
-                  provider: activeAiProvider,
-                  customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
-                }),
-                signal: abortController.signal,
-              });
+              const reqTimeoutMs = activeAiProvider === 'custom' ? 260_000 : 180_000;
+              const response = await fetchWithBackgroundTimeout(
+                '/api/translate',
+                {
+                  method: 'POST',
+                  headers: getApiHeaders(orderedKeyStrings),
+                  body: JSON.stringify({
+                    jobId: currentJobId,
+                    items: itemsToTranslate.map((i) => ({
+                      id: i.id,
+                      text: i.originalText,
+                      key: i.gameKey,
+                      context: i.context,
+                    })),
+                    sourceLanguage: sourceLanguage === 'auto' ? undefined : sourceLanguage,
+                    targetLanguage,
+                    tone: selectedTone,
+                    customPrompt,
+                    mode: 'cinema',
+                    model: effectiveModel,
+                    provider: activeAiProvider,
+                    customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
+                  }),
+                },
+                abortController.signal,
+                reqTimeoutMs
+              );
 
               if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
 
@@ -2717,9 +2797,9 @@ export default function App() {
           const hasMoreInFile = b < fileBatchCount - 1;
           if (hasMoreInFile && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
             if (rateLimitPacing && activeAiProvider !== 'custom') {
-              await new Promise((resolve) => setTimeout(resolve, 600));
+              await backgroundSleep(600);
             } else if (activeAiProvider === 'custom') {
-              await new Promise((resolve) => setTimeout(resolve, 500));
+              await backgroundSleep(500);
             }
           }
         }
@@ -2735,6 +2815,7 @@ export default function App() {
         Array.from({ length: workerCount }, (_, workerIdx) => runWorker(workerIdx))
       );
     } finally {
+      releaseKeepAlive();
       folderAbortControllersRef.current.clear();
       if (activeJobIdRef.current === currentJobId) {
         translatingFileIdsRef.current = [];

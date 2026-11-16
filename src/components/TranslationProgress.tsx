@@ -152,6 +152,11 @@ export const TranslationProgress: React.FC<TranslationProgressProps> = ({
                   {uiLang === 'en' ? `${activeWorkerCount} Files Parallel` : `${activeWorkerCount} فایل همزمان`}
                 </span>
               )}
+              {!isPaused && (
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                  {uiLang === 'en' ? 'Background Protected' : uiLang === 'ar' ? 'محمي في الخلفية' : 'اجرای پایدار در پس‌زمینه'}
+                </span>
+              )}
               {activeKeyLabels.length > 0 && (
                 <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-sky-500/15 text-sky-300 border border-sky-500/30">
                   {activeKeyLabels.join(' • ')}
