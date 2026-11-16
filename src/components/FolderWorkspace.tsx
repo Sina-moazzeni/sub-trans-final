@@ -28,6 +28,7 @@ import {
   CheckSquare,
   Square,
   Play,
+  RotateCcw,
 } from 'lucide-react';
 
 interface FolderWorkspaceProps {
@@ -48,6 +49,7 @@ interface FolderWorkspaceProps {
   setConcurrentFilesCount?: (count: number) => void;
   onAssignFileKey?: (folderId: string, fileId: string, keyId: string | undefined) => void;
   onTranslateConcurrentFiles?: (fileIds?: string[]) => void;
+  onRetranslateFolder?: (folderId: string) => void;
   onExportFullBackup?: () => void;
   onImportFullBackup?: (file: File) => Promise<void>;
   selectedEncoding: string;
@@ -85,6 +87,7 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   setConcurrentFilesCount,
   onAssignFileKey,
   onTranslateConcurrentFiles,
+  onRetranslateFolder,
   onExportFullBackup,
   onImportFullBackup,
   selectedEncoding,
@@ -364,29 +367,44 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
               )}
             </div>
 
-            {onTranslateConcurrentFiles && (
-              <button
-                type="button"
-                onClick={() => onTranslateConcurrentFiles(selectedFileIds.length > 0 ? selectedFileIds : undefined)}
-                disabled={isTranslating || activeFolder.files.length === 0}
-                className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-indigo-600 via-violet-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 shadow-md shadow-indigo-500/20 disabled:opacity-45 transition-all active:scale-95 shrink-0"
-              >
-                {isTranslating ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <Play className="w-3.5 h-3.5 fill-white" />
-                )}
-                <span>
-                  {selectedFileIds.length > 0
-                    ? (isEn
-                        ? `Translate ${selectedFileIds.length} Selected (${Math.min(concurrentFilesCount, selectedFileIds.length)}x Parallel)`
-                        : `ترجمه همزمان ${selectedFileIds.length} فایل انتخاب‌شده`)
-                    : (isEn
-                        ? `Translate ${targetCountForConcurrent} File(s) (${Math.min(concurrentFilesCount, targetCountForConcurrent)}x Parallel)`
-                        : `ترجمه همزمان فایل‌های پوشه (${targetCountForConcurrent} فایل)`)}
-                </span>
-              </button>
-            )}
+            <div className="flex items-center gap-2 flex-wrap shrink-0">
+              {onRetranslateFolder && (
+                <button
+                  type="button"
+                  onClick={() => onRetranslateFolder(activeFolder.id)}
+                  disabled={isTranslating || activeFolder.files.length === 0}
+                  className="flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold text-amber-800 dark:text-amber-200 bg-amber-100 hover:bg-amber-200 dark:bg-amber-950/50 dark:hover:bg-amber-900/60 border border-amber-300 dark:border-amber-700 disabled:opacity-45 transition-all active:scale-95 shrink-0"
+                  title={isEn ? 'Re-translate all files in this folder from scratch (EN -> FA)' : 'ترجمه مجدد کامل همه فایل‌های این پوشه از ابتدا (انگلیسی به فارسی)'}
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{isEn ? 'Re-translate Folder' : 'ترجمه مجدد پوشه'}</span>
+                </button>
+              )}
+
+              {onTranslateConcurrentFiles && (
+                <button
+                  type="button"
+                  onClick={() => onTranslateConcurrentFiles(selectedFileIds.length > 0 ? selectedFileIds : undefined)}
+                  disabled={isTranslating || activeFolder.files.length === 0}
+                  className="flex items-center justify-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-indigo-600 via-violet-600 to-purple-600 hover:from-indigo-500 hover:to-purple-500 shadow-md shadow-indigo-500/20 disabled:opacity-45 transition-all active:scale-95 shrink-0"
+                >
+                  {isTranslating ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <Play className="w-3.5 h-3.5 fill-white" />
+                  )}
+                  <span>
+                    {selectedFileIds.length > 0
+                      ? (isEn
+                          ? `Translate ${selectedFileIds.length} Selected (${Math.min(concurrentFilesCount, selectedFileIds.length)}x Parallel)`
+                          : `ترجمه همزمان ${selectedFileIds.length} فایل انتخاب‌شده`)
+                      : (isEn
+                          ? `Translate ${targetCountForConcurrent} File(s) (${Math.min(concurrentFilesCount, targetCountForConcurrent)}x Parallel)`
+                          : `ترجمه همزمان فایل‌های پوشه (${targetCountForConcurrent} فایل)`)}
+                  </span>
+                </button>
+              )}
+            </div>
           </div>
         )}
 
@@ -770,6 +788,18 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
 
                       {!isEditing && (
                         <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                          {onRetranslateFolder && (
+                            <button
+                              type="button"
+                              onClick={() => onRetranslateFolder(folder.id)}
+                              disabled={isTranslating || folder.files.length === 0}
+                              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 dark:hover:bg-amber-900/60 text-amber-700 dark:text-amber-300 border border-amber-300/70 dark:border-amber-800 disabled:opacity-40 transition-colors"
+                              title={isEn ? 'Re-translate this folder (English -> Persian)' : 'ترجمه مجدد این پوشه (انگلیسی به فارسی)'}
+                            >
+                              <RotateCcw className="w-3 h-3" />
+                              <span>{isEn ? 'Re-translate' : 'ترجمه مجدد'}</span>
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => {

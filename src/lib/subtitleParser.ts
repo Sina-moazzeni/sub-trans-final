@@ -101,35 +101,60 @@ export function secondsToASS(seconds: number): string {
 function parseTimestampParts(raw?: string): { h: number; m: number; s: number; ms: number } | null {
   if (!raw) return null;
   const cleaned = raw.trim();
-  const match = cleaned.match(/^(\d{1,3}):(\d{1,2}):(\d{1,2})(?:[.,](\d{1,3}))?$/);
+  const match = cleaned.match(/^(\d{1,4}):(\d{1,2}):(\d{1,2})(?:[.,](\d+))?$/);
   if (match) {
-    const h = parseInt(match[1], 10);
-    const m = parseInt(match[2], 10);
-    const s = parseInt(match[3], 10);
+    let h = parseInt(match[1], 10);
+    let m = parseInt(match[2], 10);
+    let s = parseInt(match[3], 10);
     const frac = match[4] || '0';
-    // ASS centiseconds have 2 digits (e.g. .50 -> 500ms); SRT/VTT have 3 digits (e.g. ,500 -> 500ms)
-    const ms = frac.length === 1
+    let ms = frac.length === 1
       ? parseInt(frac, 10) * 100
       : frac.length === 2
         ? parseInt(frac, 10) * 10
-        : parseInt(frac.padEnd(3, '0').slice(0, 3), 10);
-    if (m >= 0 && m < 60 && s >= 0 && s < 60 && ms >= 0 && ms < 1000) {
+        : frac.length === 3
+          ? parseInt(frac, 10)
+          : Math.round(parseFloat(`0.${frac}`) * 1000);
+    if (ms >= 1000) {
+      s += Math.floor(ms / 1000);
+      ms = ms % 1000;
+    }
+    if (s >= 60) {
+      m += Math.floor(s / 60);
+      s = s % 60;
+    }
+    if (m >= 60) {
+      h += Math.floor(m / 60);
+      m = m % 60;
+    }
+    if (h >= 0 && m >= 0 && s >= 0 && ms >= 0) {
       return { h, m, s, ms };
     }
   }
-  // Support MM:SS.mmm (valid WebVTT short form without hours)
-  const shortMatch = cleaned.match(/^(\d{1,2}):(\d{1,2})(?:[.,](\d{1,3}))?$/);
+  // Support MM:SS.mmm (valid WebVTT short form without hours, including M >= 60 e.g. 65:12.300)
+  const shortMatch = cleaned.match(/^(\d{1,4}):(\d{1,2})(?:[.,](\d+))?$/);
   if (shortMatch) {
-    const m = parseInt(shortMatch[1], 10);
-    const s = parseInt(shortMatch[2], 10);
+    let m = parseInt(shortMatch[1], 10);
+    let s = parseInt(shortMatch[2], 10);
     const frac = shortMatch[3] || '0';
-    const ms = frac.length === 1
+    let ms = frac.length === 1
       ? parseInt(frac, 10) * 100
       : frac.length === 2
         ? parseInt(frac, 10) * 10
-        : parseInt(frac.padEnd(3, '0').slice(0, 3), 10);
-    if (m >= 0 && m < 60 && s >= 0 && s < 60 && ms >= 0 && ms < 1000) {
-      return { h: 0, m, s, ms };
+        : frac.length === 3
+          ? parseInt(frac, 10)
+          : Math.round(parseFloat(`0.${frac}`) * 1000);
+    if (ms >= 1000) {
+      s += Math.floor(ms / 1000);
+      ms = ms % 1000;
+    }
+    if (s >= 60) {
+      m += Math.floor(s / 60);
+      s = s % 60;
+    }
+    const h = Math.floor(m / 60);
+    m = m % 60;
+    if (h >= 0 && m >= 0 && s >= 0 && ms >= 0) {
+      return { h, m, s, ms };
     }
   }
   return null;
@@ -191,9 +216,10 @@ export function detectFormat(filename: string, content: string): SubtitleFormat 
   if (ext === 'sub') return 'sub';
   if (ext === 'srt') return 'srt';
 
-  if (content.startsWith('WEBVTT') || content.includes('\nWEBVTT')) return 'vtt';
-  if (content.includes('[Script Info]') || content.includes('Dialogue:')) return 'ass';
-  if (/^\{\d+\}\{\d+\}/m.test(content.trim())) return 'sub';
+  const cleanContent = content.replace(/^\uFEFF/, '').trimStart();
+  if (cleanContent.startsWith('WEBVTT') || cleanContent.includes('\nWEBVTT')) return 'vtt';
+  if (cleanContent.includes('[Script Info]') || cleanContent.includes('Dialogue:')) return 'ass';
+  if (/^\{\d+\}\{\d+\}/m.test(cleanContent)) return 'sub';
 
   return 'srt';
 }
@@ -365,31 +391,56 @@ function parseSRTFallback(text: string): { items: SubtitleItem[]; format: Subtit
  * preserved verbatim into the header), and cue identifier lines (e.g. "cue-1") are kept on the
  * item as `cueId` so the export can restore them.
  */
-function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFormat; rawHeader?: string } {
+const isVttTimestampLine = (raw: string): boolean => {
+  const trimmed = raw.trim();
+  return /^(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?\s*-->\s*(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?(?:\s+.*)?$/.test(trimmed);
+};
+
+function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFormat; rawHeader?: string; warnings?: string[] } {
   const lines = content.split('\n');
   const items: SubtitleItem[] = [];
   const headerBlocks: string[] = [];
+  const warnings: string[] = [];
   let autoId = 1;
 
   let inHeader = true;
   let currentBlock: string[] = [];
 
-  // A block-level VTT construct (NOTE/STYLE/REGION) — must never be treated as cue text
-  const isBlockLevelKeyword = (raw: string) => /^(NOTE|STYLE|REGION)\b/i.test(raw.trim());
+  // A block-level VTT construct (NOTE/STYLE/REGION) — only valid at block boundary, NEVER inside an active cue
+  const isBlockLevelKeyword = (raw: string) => /^(NOTE|STYLE|REGION)(?:\s|$)/i.test(raw.trim());
+
+  let hasXTimestampMap = false;
+  let hasInlineKaraokeTs = false;
+  let nonMonotonicCount = 0;
 
   for (let i = 0; i < lines.length; i++) {
     const rawLine = lines[i];
     const line = rawLine.trim();
 
-    // Check if line is timestamp line
-    if (line.includes('-->')) {
+    if (/^X-TIMESTAMP-MAP=/i.test(line)) {
+      hasXTimestampMap = true;
+    }
+
+    // Check if line is a genuine WebVTT timestamp line
+    if (isVttTimestampLine(line)) {
       inHeader = false;
-      if (currentBlock.length > 0) {
-        // If currentBlock had cue identifier before this timestamp line, keep it with the cue
-        const prevLines = [...currentBlock];
-        currentBlock = [];
-        // Extract any leading lines that were not cue identifiers into header if still at top
-        currentBlock.push(...prevLines);
+      // If currentBlock ALREADY has a cue timestamp, flush the prior cue first so back-to-back cues
+      // without a separating blank line never merge together or drop cue #2's timestamps!
+      if (currentBlock.some((l) => isVttTimestampLine(l))) {
+        const lastLine = currentBlock[currentBlock.length - 1]?.trim() || '';
+        const looksLikeCueId =
+          currentBlock.length >= 2 &&
+          !isVttTimestampLine(lastLine) &&
+          (/^[\d]+$/.test(lastLine) || /^[A-Za-z0-9_.-]{1,32}$/.test(lastLine));
+
+        if (looksLikeCueId && currentBlock.length >= 3) {
+          const carriedCueId = currentBlock.pop()!;
+          processVTTBlock(currentBlock, autoId++, items);
+          currentBlock = [carriedCueId];
+        } else {
+          processVTTBlock(currentBlock, autoId++, items);
+          currentBlock = [];
+        }
       }
       currentBlock.push(rawLine);
       continue;
@@ -397,22 +448,16 @@ function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFor
 
     if (inHeader) {
       headerBlocks.push(rawLine);
-      // FIX (L9): per the WebVTT spec the header block ends at the FIRST BLANK LINE — not at
-      // the first timestamp. Previously a cue identifier placed before the FIRST cue ("cue-1")
-      // was swallowed into the header and lost from the export.
       if (line === '' && headerBlocks.some((l) => l.trim() !== '')) {
         inHeader = false;
       }
       continue;
     }
 
-    // FIX (L9): NOTE/STYLE/REGION blocks mid-file — flush the pending cue first, then
-    // consume the whole block (until a blank line) verbatim into the header so it is
-    // preserved in the output instead of being glued to the next cue's text.
-    if (isBlockLevelKeyword(rawLine)) {
-      if (currentBlock.length > 0) {
-        processVTTBlock(currentBlock, autoId++, items);
-        currentBlock = [];
+    // Only treat NOTE/STYLE/REGION as block-level metadata when NOT already inside a cue
+    if (currentBlock.length === 0 && isBlockLevelKeyword(rawLine)) {
+      if (headerBlocks.length > 0 && headerBlocks[headerBlocks.length - 1].trim() !== '') {
+        headerBlocks.push('');
       }
       headerBlocks.push(rawLine);
       while (i + 1 < lines.length && lines[i + 1].trim() !== '') {
@@ -428,6 +473,9 @@ function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFor
         currentBlock = [];
       }
     } else {
+      if (/<\d{1,2}:\d{2}(?::\d{2})?[.,]\d{2,3}>/.test(rawLine)) {
+        hasInlineKaraokeTs = true;
+      }
       currentBlock.push(rawLine);
     }
   }
@@ -436,17 +484,40 @@ function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFor
     processVTTBlock(currentBlock, autoId++, items);
   }
 
+  for (let idx = 1; idx < items.length; idx++) {
+    if (items[idx].startSeconds + 0.001 < items[idx - 1].startSeconds) {
+      nonMonotonicCount++;
+    }
+  }
+
+  if (hasXTimestampMap) {
+    warnings.push('این فایل VTT دارای هدر HLS (X-TIMESTAMP-MAP) است که در خروجی استاندارد حذف می‌شود تا تایم‌بندی در پلیرها جابه‌جا نشود.');
+  }
+  if (hasInlineKaraokeTs) {
+    warnings.push('فایل VTT ورودی دارای تایم‌کدهای درون‌خطی (شبیه زیرنویس خودکار یوتیوب) است.');
+  }
+  if (nonMonotonicCount > 0) {
+    warnings.push(`در خود فایل VTT ورودی ${nonMonotonicCount} مورد تایم‌بندی نامرتب یا هم‌پوشانی زمانی مشاهده شد.`);
+  }
+
+  // Strip X-TIMESTAMP-MAP from saved header so standalone exports never suffer HLS MPEGTS clock drift
+  const cleanedHeader = headerBlocks
+    .filter((l) => !/^X-TIMESTAMP-MAP=/i.test(l.trim()))
+    .join('\n')
+    .trim();
+
   return {
     items,
     format: 'vtt',
-    rawHeader: headerBlocks.join('\n').trim(),
+    rawHeader: cleanedHeader,
+    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
 function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
   let timeLineIdx = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (lines[i].includes('-->')) {
+    if (isVttTimestampLine(lines[i])) {
       timeLineIdx = i;
       break;
     }
@@ -468,7 +539,7 @@ function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
 
   const textLines = lines.slice(timeLineIdx + 1).join('\n').trim();
 
-  // FIX (L9): capture the cue identifier (any non-timestamp line(s) before the timestamp line)
+  // Capture cue identifier (any non-timestamp line(s) before the timestamp line)
   const identifierLines = lines.slice(0, timeLineIdx).map((l) => l.trim()).filter(Boolean);
   const cueId = identifierLines.length > 0 ? identifierLines[identifierLines.length - 1] : undefined;
 
@@ -478,8 +549,8 @@ function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
 
   items.push({
     id,
-    startTime: startPart,
-    endTime: endPart,
+    startTime: normalizeTimestampToVTT(startPart, startSec),
+    endTime: normalizeTimestampToVTT(endPart, endSec),
     startSeconds: startSec,
     endSeconds: endSec,
     originalText: textLines,
@@ -791,14 +862,27 @@ function exportSRT(items: SubtitleItem[]): string {
     .join('\n');
 }
 
+function isValidVttCueSettings(raw?: string): boolean {
+  if (!raw || !raw.trim()) return false;
+  const tokens = raw.trim().split(/\s+/);
+  return tokens.every((tok) => /^(vertical|line|position|size|align|region):[^\s]+$/i.test(tok));
+}
+
 function exportVTT(items: SubtitleItem[], rawHeader?: string): string {
-  const header = rawHeader && rawHeader.startsWith('WEBVTT') ? rawHeader : 'WEBVTT';
+  const cleanedHeader = rawHeader && rawHeader.startsWith('WEBVTT')
+    ? rawHeader
+        .split('\n')
+        .filter((l) => !/^X-TIMESTAMP-MAP=/i.test(l.trim()))
+        .join('\n')
+        .trim()
+    : 'WEBVTT';
+  const header = cleanedHeader.startsWith('WEBVTT') ? cleanedHeader : 'WEBVTT';
   const body = items
     .map((item) => {
       const text = item.translatedText.trim() || item.originalText.trim();
       const start = normalizeTimestampToVTT(item.startTime, item.startSeconds);
       const end = normalizeTimestampToVTT(item.endTime, item.endSeconds);
-      const settingsStr = item.styleTags ? ` ${item.styleTags}` : '';
+      const settingsStr = isValidVttCueSettings(item.styleTags) ? ` ${item.styleTags!.trim()}` : '';
       // FIX (L9): restore the cue identifier when the source file had one
       const idStr = item.cueId ? `${item.cueId}\n` : '';
       return `${idStr}${start} --> ${end}${settingsStr}\n${text}\n`;

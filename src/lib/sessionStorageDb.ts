@@ -51,7 +51,7 @@ export function createDefaultSession(mode: AppMode): ModeSessionState {
       hasHeaders: true,
     },
     gameOriginalStructure: null,
-    sourceLanguage: 'auto',
+    sourceLanguage: 'en',
     detectedSourceLang: '',
     targetLanguage: 'fa',
     selectedTone: mode === 'cinema' ? 'cinematic' : 'epic',

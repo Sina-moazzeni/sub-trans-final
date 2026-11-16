@@ -189,8 +189,8 @@ export default function App() {
   });
   const [gameOriginalStructure, setGameOriginalStructure] = useState<any>(null);
 
-  // Config options
-  const [sourceLanguage, setSourceLanguage] = useState<string>('auto');
+  // Config options (Default: English -> Persian)
+  const [sourceLanguage, setSourceLanguage] = useState<string>('en');
   const [detectedSourceLang, setDetectedSourceLang] = useState<string>('');
   const [targetLanguage, setTargetLanguage] = useState<string>('fa');
   const [selectedTone, setSelectedTone] = useState<ToneOption>('cinematic');
@@ -2054,6 +2054,7 @@ export default function App() {
     const allowedExts = new Set(['srt', 'vtt', 'ass', 'ssa', 'sub', 'txt']);
     const incoming = Array.from(fileList);
     const parsedFiles: SubtitleFolderFile[] = [];
+    const batchWarnings = new Set<string>();
     let skippedCount = 0;
 
     for (const file of incoming) {
@@ -2069,6 +2070,9 @@ export default function App() {
         if (parsed.items.length === 0) {
           skippedCount++;
           continue;
+        }
+        if (Array.isArray(parsed.warnings)) {
+          parsed.warnings.forEach((w) => batchWarnings.add(`${file.name}: ${w}`));
         }
         parsedFiles.push({
           id: 'file_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 7),
@@ -2086,6 +2090,10 @@ export default function App() {
         console.warn('Failed to parse subtitle file in batch:', file.name, err);
         skippedCount++;
       }
+    }
+
+    if (batchWarnings.size > 0) {
+      Array.from(batchWarnings).slice(0, 3).forEach((w) => showToast(w, 'warning'));
     }
 
     if (parsedFiles.length === 0) {
@@ -2330,9 +2338,13 @@ export default function App() {
   };
 
   // Concurrent Multi-File Translation Engine with Per-File Dedicated Keys, RPM Rate-Limiting & Daily Quota Failover
-  const handleTranslateFilesConcurrently = async (explicitFileIds?: string[]) => {
+  const handleTranslateFilesConcurrently = async (
+    explicitFileIds?: string[],
+    options?: { targetFolderId?: string; forceRetranslate?: boolean }
+  ) => {
     if (isTranslatingRef.current) return;
-    const folder = foldersRef.current.find((f) => f.id === activeFolderIdRef.current);
+    const targetFolderId = options?.targetFolderId || activeFolderIdRef.current;
+    let folder = foldersRef.current.find((f) => f.id === targetFolderId);
     if (!folder || folder.files.length === 0) {
       showToast(t.noSubtitlesToTranslate, 'warning');
       return;
@@ -2363,10 +2375,47 @@ export default function App() {
       }
     }
 
+    // Activate target folder and clear existing translations when forceRetranslate is requested
+    if (options?.forceRetranslate) {
+      const resetFiles: SubtitleFolderFile[] = folder.files.map((fl) => {
+        const shouldReset = !explicitFileIds || explicitFileIds.length === 0 || explicitFileIds.includes(fl.id);
+        if (!shouldReset) return fl;
+        return {
+          ...fl,
+          status: 'pending',
+          items: fl.items.map((it) => ({ ...it, translatedText: '' })),
+        };
+      });
+      const resetFolder: SubtitleFolder = {
+        ...folder,
+        updatedAt: Date.now(),
+        files: resetFiles,
+      };
+      foldersRef.current = foldersRef.current.map((f) => (f.id === resetFolder.id ? resetFolder : f));
+      setFolders(foldersRef.current);
+      folder = resetFolder;
+      void saveFolderToDb(resetFolder);
+
+      if (activeFolderIdRef.current !== resetFolder.id) {
+        setActiveFolderId(resetFolder.id);
+        activeFolderIdRef.current = resetFolder.id;
+      }
+      const nextActiveFile =
+        resetFolder.files.find((fl) => fl.id === activeFileIdRef.current) || resetFolder.files[0] || null;
+      if (nextActiveFile) {
+        setActiveFileId(nextActiveFile.id);
+        activeFileIdRef.current = nextActiveFile.id;
+        loadFolderFileIntoEditor(nextActiveFile);
+      }
+      setInTranslationView(true);
+    }
+
     let filesQueue: SubtitleFolderFile[];
     if (explicitFileIds && explicitFileIds.length > 0) {
       const idSet = new Set(explicitFileIds);
       filesQueue = folder.files.filter((fl) => idSet.has(fl.id));
+    } else if (options?.forceRetranslate) {
+      filesQueue = folder.files;
     } else {
       const filesPending = folder.files.filter((fl) => fl.items.some((it) => !it.translatedText?.trim()));
       filesQueue = filesPending.length > 0 ? filesPending : folder.files;
@@ -2708,6 +2757,21 @@ export default function App() {
     }
   };
 
+  const handleRetranslateFolder = (folderId: string) => {
+    if (isTranslatingRef.current) return;
+    setSelectedFileIds([]);
+    if (sourceLanguage === 'auto') {
+      setSourceLanguage('en');
+    }
+    if (!targetLanguage) {
+      setTargetLanguage('fa');
+    }
+    void handleTranslateFilesConcurrently(undefined, {
+      targetFolderId: folderId,
+      forceRetranslate: true,
+    });
+  };
+
   // Fast Batch Export Entire Folder in SRT or VTT (.ZIP)
   const handleBatchExportFolder = (format: 'srt' | 'vtt') => {
     const folder = foldersRef.current.find((f) => f.id === activeFolderIdRef.current);
@@ -2822,7 +2886,8 @@ export default function App() {
             concurrentFilesCount={concurrentFilesCount}
             setConcurrentFilesCount={setConcurrentFilesCount}
             onAssignFileKey={handleAssignFileKey}
-            onTranslateConcurrentFiles={handleTranslateFilesConcurrently}
+            onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
+            onRetranslateFolder={handleRetranslateFolder}
             onExportFullBackup={handleExportFullBackup}
             onImportFullBackup={handleImportFullBackup}
             selectedEncoding={selectedEncoding}
@@ -2862,7 +2927,8 @@ export default function App() {
                 concurrentFilesCount={concurrentFilesCount}
                 setConcurrentFilesCount={setConcurrentFilesCount}
                 onAssignFileKey={handleAssignFileKey}
-                onTranslateConcurrentFiles={handleTranslateFilesConcurrently}
+                onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
+                onRetranslateFolder={handleRetranslateFolder}
                 onExportFullBackup={handleExportFullBackup}
                 onImportFullBackup={handleImportFullBackup}
                 selectedEncoding={selectedEncoding}
