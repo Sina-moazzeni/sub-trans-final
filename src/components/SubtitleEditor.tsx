@@ -3,6 +3,7 @@ import { useVirtualizer } from '@tanstack/react-virtual';
 import { SubtitleItem, BilingualConfig, AppMode } from '../types';
 import { UILanguage, TRANSLATIONS } from '../lib/i18n';
 import { SubtitleRowItem } from './SubtitleRowItem';
+import { isItemTranslationIncomplete } from '../lib/translationCompleteness';
 import { 
   Search, 
   Sparkles, 
@@ -40,6 +41,7 @@ interface SubtitleEditorProps {
   onFillEmptyWithOriginal: () => void;
   onRepairCorruptedSubtitles?: () => void;
   uiLang: UILanguage;
+  targetLanguage?: string;
   onOpenBilingualModal?: () => void;
   bilingualConfig?: BilingualConfig;
 }
@@ -59,6 +61,7 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
   onFillEmptyWithOriginal,
   onRepairCorruptedSubtitles,
   uiLang,
+  targetLanguage = 'fa',
   onOpenBilingualModal,
   bilingualConfig,
 }) => {
@@ -114,12 +117,12 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
 
       if (!matchSearch) return false;
 
-      if (filterMode === 'untranslated') return !item.translatedText.trim();
-      if (filterMode === 'translated') return !!item.translatedText.trim();
+      if (filterMode === 'untranslated') return isItemTranslationIncomplete(item, targetLanguage);
+      if (filterMode === 'translated') return !isItemTranslationIncomplete(item, targetLanguage);
       if (filterMode === 'modified') return !!item.sourceModified;
       return true;
     });
-  }, [items, searchQuery, filterMode]);
+  }, [items, searchQuery, filterMode, targetLanguage]);
 
   // Reset pagination on search or filter change
   useEffect(() => {
@@ -218,7 +221,15 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
   };
 
   const modifiedCount = useMemo(() => items.filter((i) => i.sourceModified).length, [items]);
-  const translatedCount = useMemo(() => items.filter((i) => i.translatedText.trim()).length, [items]);
+  const translatedCount = useMemo(
+    () => items.filter((i) => !isItemTranslationIncomplete(i, targetLanguage)).length,
+    [items, targetLanguage]
+  );
+  const completionPct = items.length === 0
+    ? 0
+    : translatedCount === items.length
+      ? 100
+      : Math.min(99, Math.floor((translatedCount / items.length) * 100));
 
   // Render Top Header Controls
   const renderHeaderControls = () => (
@@ -243,7 +254,7 @@ export const SubtitleEditor: React.FC<SubtitleEditorProps> = ({
             {items.length} {t.linesCount}
           </span>
           <span className="text-[10px] text-emerald-600 dark:text-emerald-400 font-bold bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-            {translatedCount} / {items.length} ({Math.round((translatedCount / (items.length || 1)) * 100)}%)
+            {translatedCount} / {items.length} ({completionPct}%)
           </span>
         </div>
 

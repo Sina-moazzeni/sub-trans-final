@@ -2,6 +2,7 @@ import React, { useRef, useState } from 'react';
 import { AIProvider, SubtitleFolder, SubtitleFolderFile } from '../types';
 import { StoredApiKey, isKeyQuotaExhausted } from '../lib/apiKeyManager';
 import { UILanguage, TRANSLATIONS } from '../lib/i18n';
+import { getFileCompletionStats, getFolderCompletionStats } from '../lib/translationCompleteness';
 import {
   FolderPlus,
   FolderOpen,
@@ -29,6 +30,8 @@ import {
   Square,
   Play,
   RotateCcw,
+  Wand2,
+  AlertCircle,
 } from 'lucide-react';
 
 interface FolderWorkspaceProps {
@@ -50,6 +53,10 @@ interface FolderWorkspaceProps {
   onAssignFileKey?: (folderId: string, fileId: string, keyId: string | undefined) => void;
   onTranslateConcurrentFiles?: (fileIds?: string[]) => void;
   onRetranslateFolder?: (folderId: string) => void;
+  onCompleteMissingFolder?: (folderId: string) => void;
+  onBatchExportCompletedFiles?: (folderId: string, format: 'srt' | 'vtt') => void;
+  onClearCompletedFilesBatch?: (folderId: string) => void;
+  targetLanguage?: string;
   onExportFullBackup?: () => void;
   onImportFullBackup?: (file: File) => Promise<void>;
   selectedEncoding: string;
@@ -88,6 +95,10 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   onAssignFileKey,
   onTranslateConcurrentFiles,
   onRetranslateFolder,
+  onCompleteMissingFolder,
+  onBatchExportCompletedFiles,
+  onClearCompletedFilesBatch,
+  targetLanguage = 'fa',
   onExportFullBackup,
   onImportFullBackup,
   selectedEncoding,
@@ -130,21 +141,35 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   };
 
   const getFileStats = (file: SubtitleFolderFile) => {
-    const total = file.items.length;
-    const translated = file.items.filter((it) => it.translatedText && it.translatedText.trim().length > 0).length;
-    const pct = total > 0 ? Math.round((translated / total) * 100) : 0;
-    return { total, translated, pct, isDone: total > 0 && translated === total };
+    const s = getFileCompletionStats(file, targetLanguage);
+    return {
+      total: s.total,
+      translated: s.completed,
+      missingCount: s.missingCount,
+      pct: s.pct,
+      isDone: s.isDone,
+    };
   };
 
   const getFolderStats = (folder: SubtitleFolder) => {
-    let totalLines = 0;
-    let translatedLines = 0;
-    folder.files.forEach((f) => {
-      totalLines += f.items.length;
-      translatedLines += f.items.filter((it) => it.translatedText && it.translatedText.trim().length > 0).length;
-    });
-    const pct = totalLines > 0 ? Math.round((translatedLines / totalLines) * 100) : 0;
-    return { fileCount: folder.files.length, totalLines, translatedLines, pct };
+    const s = getFolderCompletionStats(folder, targetLanguage);
+    return {
+      fileCount: s.fileCount,
+      totalLines: s.totalLines,
+      translatedLines: s.completedLines,
+      missingLines: s.missingLines,
+      incompleteFileCount: s.incompleteFileCount,
+      completedFileCount: s.completedFileCount,
+      pct: s.pct,
+      isDone: s.isDone,
+    };
+  };
+
+  const getCompletedBatchFiles = (folder: SubtitleFolder) => {
+    const ids = folder.lastCompletedFileIds || [];
+    if (ids.length === 0) return [];
+    const idSet = new Set(ids);
+    return folder.files.filter((fl) => idSet.has(fl.id));
   };
 
   const handleCreateSubmit = (e: React.FormEvent) => {
@@ -226,18 +251,24 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   // ============================================================================
   if (inTranslationView && activeFolder) {
     const stats = getFolderStats(activeFolder);
+    const completedBatchFiles = getCompletedBatchFiles(activeFolder);
+    const completedBatchIdSet = new Set(completedBatchFiles.map((f) => f.id));
     const allSelected = activeFolder.files.length > 0 && activeFolder.files.every((f) => selectedFileIds.includes(f.id));
     const targetCountForConcurrent = selectedFileIds.length > 0
       ? selectedFileIds.length
-      : activeFolder.files.filter((fl) => fl.items.some((it) => !it.translatedText?.trim())).length || activeFolder.files.length;
+      : stats.incompleteFileCount || activeFolder.files.length;
 
     return (
       <div className="w-full bg-white/95 dark:bg-slate-900/90 rounded-2xl border border-indigo-500/25 dark:border-indigo-500/35 p-4 lg:p-5 shadow-md dark:shadow-xl backdrop-blur-md flex flex-col gap-4 transition-all">
         {/* Top Row: Folder Info + Navigation + Backup + Fast Batch Export SRT & VTT */}
         <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-3.5 border-b border-slate-200 dark:border-slate-800">
           <div className="flex items-center gap-3 flex-wrap">
-            <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center text-indigo-600 dark:text-indigo-400 shrink-0">
-              <FolderOpen className="w-5 h-5" />
+            <div className={`w-10 h-10 rounded-xl border flex items-center justify-center shrink-0 ${
+              stats.isDone
+                ? 'bg-emerald-500/15 border-emerald-500/30 text-emerald-600 dark:text-emerald-400'
+                : 'bg-indigo-500/15 border-indigo-500/30 text-indigo-600 dark:text-indigo-400'
+            }`}>
+              {stats.isDone ? <CheckCircle2 className="w-5 h-5" /> : <FolderOpen className="w-5 h-5" />}
             </div>
             <div>
               <div className="flex items-center gap-2 flex-wrap">
@@ -247,14 +278,29 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-700 dark:text-indigo-300 border border-indigo-500/25">
                   {stats.fileCount} {isEn ? 'files' : 'فایل'}
                 </span>
-                <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border border-emerald-500/25">
-                  {stats.translatedLines}/{stats.totalLines} ({stats.pct}%)
+                <span className={`inline-flex items-center gap-1 text-[10px] font-mono font-bold px-2 py-0.5 rounded-full border ${
+                  stats.isDone
+                    ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/35'
+                    : 'bg-amber-500/10 text-amber-700 dark:text-amber-300 border-amber-500/30'
+                }`}>
+                  {stats.isDone && <CheckCircle2 className="w-3 h-3" />}
+                  <span>{stats.translatedLines}/{stats.totalLines} ({stats.pct}%)</span>
                 </span>
+                {stats.missingLines > 0 && (
+                  <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-700 dark:text-rose-300 border border-rose-500/25">
+                    <AlertCircle className="w-3 h-3" />
+                    <span>
+                      {isEn
+                        ? `${stats.incompleteFileCount} incomplete (${stats.missingLines} lines)`
+                        : `${stats.incompleteFileCount} فایل ناقص • ${stats.missingLines} خط باقی‌مانده`}
+                    </span>
+                  </span>
+                )}
               </div>
               <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
                 {isEn
-                  ? 'Assign a separate API key per file, select multiple files to translate concurrently, or batch-export in SRT / VTT.'
-                  : 'برای هر فایل کلید دلخواه تعیین کنید، چند فایل را همزمان ترجمه کنید یا کل پوشه را با فرمت SRT و VTT خروجی بگیرید.'}
+                  ? 'Assign a separate API key per file, complete only remaining untranslated lines, or batch-export in SRT / VTT.'
+                  : 'برای هر فایل کلید دلخواه تعیین کنید، خطوط باقی‌مانده پوشه را تکمیل کنید یا کل پوشه را با تایم‌بندی دقیق خروجی بگیرید.'}
               </p>
             </div>
           </div>
@@ -368,6 +414,23 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
             </div>
 
             <div className="flex items-center gap-2 flex-wrap shrink-0">
+              {onCompleteMissingFolder && stats.incompleteFileCount > 0 && (
+                <button
+                  type="button"
+                  onClick={() => onCompleteMissingFolder(activeFolder.id)}
+                  disabled={isTranslating}
+                  className="flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold text-white bg-gradient-to-r from-emerald-600 to-green-600 hover:from-emerald-500 hover:to-green-500 border border-emerald-400/30 shadow-md shadow-emerald-600/20 disabled:opacity-45 transition-all active:scale-95 shrink-0"
+                  title={isEn ? 'Translate ONLY remaining missing or untranslated English lines in this folder' : 'ترجمه فقط خطوط باقی‌مانده و انگلیسی فایل‌های ناقص این پوشه'}
+                >
+                  <Wand2 className="w-3.5 h-3.5" />
+                  <span>
+                    {isEn
+                      ? `Complete Missing (${stats.incompleteFileCount}f / ${stats.missingLines}l)`
+                      : `تکمیل خطوط باقی‌مانده (${stats.incompleteFileCount} فایل • ${stats.missingLines} خط)`}
+                  </span>
+                </button>
+              )}
+
               {onRetranslateFolder && (
                 <button
                   type="button"
@@ -402,6 +465,63 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                           ? `Translate ${targetCountForConcurrent} File(s) (${Math.min(concurrentFilesCount, targetCountForConcurrent)}x Parallel)`
                           : `ترجمه همزمان فایل‌های پوشه (${targetCountForConcurrent} فایل)`)}
                   </span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Dedicated Separate Download Strip for ONLY the Files Recently Completed */}
+        {completedBatchFiles.length > 0 && onBatchExportCompletedFiles && (
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 px-4 py-3 rounded-xl bg-emerald-50/90 dark:bg-emerald-950/35 border border-emerald-400/50 dark:border-emerald-700/70 shadow-sm">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-emerald-500/20 text-emerald-600 dark:text-emerald-400 flex items-center justify-center shrink-0 mt-0.5">
+                <CheckCircle2 className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="text-xs font-bold text-emerald-900 dark:text-emerald-200 flex items-center gap-2 flex-wrap">
+                  <span>
+                    {isEn
+                      ? `Completed Files Ready for Separate Download (${completedBatchFiles.length} file(s))`
+                      : `فایل‌های تکمیل‌شده آماده دانلود جداگانه (${completedBatchFiles.length} فایل)`}
+                  </span>
+                </div>
+                <div className="text-[11px] text-emerald-700 dark:text-emerald-300/90 mt-0.5 truncate font-mono" title={completedBatchFiles.map((f) => f.fileName).join(' • ')}>
+                  {completedBatchFiles.slice(0, 4).map((f) => f.fileName).join('  •  ')}
+                  {completedBatchFiles.length > 4 ? `  +${completedBatchFiles.length - 4}` : ''}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap shrink-0">
+              <button
+                type="button"
+                onClick={() => onBatchExportCompletedFiles(activeFolder.id, 'srt')}
+                disabled={isTranslating}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-500 shadow-sm disabled:opacity-50 transition-all active:scale-95"
+                title={isEn ? 'Download ONLY the completed files as .SRT' : 'دانلود یکجای فقط فایل‌های تکمیل‌شده با فرمت SRT'}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{isEn ? 'Download Completed (.SRT)' : 'دانلود فقط تکمیل‌شده‌ها (SRT)'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onBatchExportCompletedFiles(activeFolder.id, 'vtt')}
+                disabled={isTranslating}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-white bg-teal-600 hover:bg-teal-500 shadow-sm disabled:opacity-50 transition-all active:scale-95"
+                title={isEn ? 'Download ONLY the completed files as .VTT' : 'دانلود یکجای فقط فایل‌های تکمیل‌شده با فرمت VTT'}
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>{isEn ? 'Download Completed (.VTT)' : 'دانلود فقط تکمیل‌شده‌ها (VTT)'}</span>
+              </button>
+              {onClearCompletedFilesBatch && (
+                <button
+                  type="button"
+                  onClick={() => onClearCompletedFilesBatch(activeFolder.id)}
+                  className="p-1.5 rounded-lg text-emerald-700 dark:text-emerald-400 hover:bg-emerald-500/15 transition-colors"
+                  title={isEn ? 'Dismiss notice' : 'بستن این نوار'}
+                >
+                  <X className="w-3.5 h-3.5" />
                 </button>
               )}
             </div>
@@ -469,17 +589,32 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                     </div>
 
                     <div className="min-w-0">
-                      <div className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate font-mono" title={file.fileName}>
-                        {file.fileName}
+                      <div className="flex items-center gap-1.5">
+                        <div className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate font-mono" title={file.fileName}>
+                          {file.fileName}
+                        </div>
+                        {completedBatchIdSet.has(file.id) && (
+                          <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 shrink-0">
+                            {isEn ? 'Fixed' : 'تکمیل‌شده'}
+                          </span>
+                        )}
                       </div>
-                      <div className="flex items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
+                      <div className="flex items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 flex-wrap">
                         <span className="uppercase font-mono font-bold text-indigo-600 dark:text-indigo-400">
                           .{file.sourceFormat}
                         </span>
                         <span>•</span>
-                        <span className="font-mono">
+                        <span className={`font-mono ${fStats.isDone ? 'text-emerald-600 dark:text-emerald-400 font-bold' : ''}`}>
                           {fStats.translated}/{fStats.total} ({fStats.pct}%)
                         </span>
+                        {!fStats.isDone && fStats.missingCount > 0 && (
+                          <>
+                            <span>•</span>
+                            <span className="text-amber-600 dark:text-amber-400 font-semibold">
+                              {isEn ? `${fStats.missingCount} left` : `${fStats.missingCount} خط باقی‌مانده`}
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -706,119 +841,184 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 folders.map((folder) => {
                   const isSelected = activeFolder?.id === folder.id;
                   const fStats = getFolderStats(folder);
+                  const folderCompletedBatch = getCompletedBatchFiles(folder);
                   const isEditing = editingFolderId === folder.id;
 
                   return (
                     <div
                       key={folder.id}
                       onClick={() => !isEditing && onSelectFolder(folder.id)}
-                      className={`p-3 rounded-xl border transition-all cursor-pointer flex items-center justify-between gap-2 ${
+                      className={`p-3 rounded-xl border transition-all cursor-pointer flex flex-col gap-2 ${
                         isSelected
                           ? 'bg-indigo-50 dark:bg-indigo-950/40 border-indigo-500 ring-2 ring-indigo-500/20 shadow-xs'
                           : 'bg-white dark:bg-slate-900/70 border-slate-200 dark:border-slate-800 hover:border-slate-300 dark:hover:border-slate-700'
                       }`}
                     >
-                      <div className="flex items-center gap-2.5 min-w-0 flex-1">
-                        <div className={`p-2 rounded-lg shrink-0 ${
-                          isSelected
-                            ? 'bg-indigo-500/20 text-indigo-600 dark:text-indigo-400'
-                            : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
-                        }`}>
-                          {isSelected ? <FolderOpen className="w-4 h-4" /> : <Folder className="w-4 h-4" />}
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                          <div className={`p-2 rounded-lg shrink-0 ${
+                            fStats.isDone
+                              ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                              : isSelected
+                                ? 'bg-indigo-500/20 text-indigo-600 dark:text-indigo-400'
+                                : 'bg-slate-100 dark:bg-slate-800 text-slate-500'
+                          }`}>
+                            {fStats.isDone ? (
+                              <CheckCircle2 className="w-4 h-4" />
+                            ) : isSelected ? (
+                              <FolderOpen className="w-4 h-4" />
+                            ) : (
+                              <Folder className="w-4 h-4" />
+                            )}
+                          </div>
+
+                          {isEditing ? (
+                            <div className="flex items-center gap-1 flex-1" onClick={(e) => e.stopPropagation()}>
+                              <input
+                                type="text"
+                                value={editingName}
+                                onChange={(e) => setEditingName(e.target.value)}
+                                autoFocus
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && editingName.trim()) {
+                                    onRenameFolder(folder.id, editingName.trim());
+                                    setEditingFolderId(null);
+                                  } else if (e.key === 'Escape') {
+                                    setEditingFolderId(null);
+                                  }
+                                }}
+                                className="flex-1 bg-white dark:bg-slate-950 border border-indigo-400 rounded-lg px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none"
+                              />
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (editingName.trim()) {
+                                    onRenameFolder(folder.id, editingName.trim());
+                                  }
+                                  setEditingFolderId(null);
+                                }}
+                                className="p-1 text-emerald-500 hover:bg-emerald-500/10 rounded"
+                              >
+                                <Check className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setEditingFolderId(null)}
+                                className="p-1 text-slate-400 hover:bg-slate-500/10 rounded"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          ) : (
+                            <div className="min-w-0 flex-1">
+                              <div className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate">
+                                {folder.name}
+                              </div>
+                              <div className="flex items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 flex-wrap">
+                                <span>{fStats.fileCount} {isEn ? 'files' : 'فایل'}</span>
+                                <span>•</span>
+                                <span>{fStats.totalLines} {t.linesCount}</span>
+                                {fStats.totalLines > 0 && (
+                                  <>
+                                    <span>•</span>
+                                    <span className={`font-bold ${fStats.isDone ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                      {fStats.pct}%
+                                    </span>
+                                  </>
+                                )}
+                                {fStats.incompleteFileCount > 0 && (
+                                  <>
+                                    <span>•</span>
+                                    <span className="text-rose-600 dark:text-rose-400 font-semibold">
+                                      {isEn
+                                        ? `${fStats.incompleteFileCount} incomplete (${fStats.missingLines}l)`
+                                        : `${fStats.incompleteFileCount} ناقص (${fStats.missingLines} خط)`}
+                                    </span>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          )}
                         </div>
 
-                        {isEditing ? (
-                          <div className="flex items-center gap-1 flex-1" onClick={(e) => e.stopPropagation()}>
-                            <input
-                              type="text"
-                              value={editingName}
-                              onChange={(e) => setEditingName(e.target.value)}
-                              autoFocus
-                              onKeyDown={(e) => {
-                                if (e.key === 'Enter' && editingName.trim()) {
-                                  onRenameFolder(folder.id, editingName.trim());
-                                  setEditingFolderId(null);
-                                } else if (e.key === 'Escape') {
-                                  setEditingFolderId(null);
-                                }
-                              }}
-                              className="flex-1 bg-white dark:bg-slate-950 border border-indigo-400 rounded-lg px-2 py-1 text-xs text-slate-900 dark:text-white focus:outline-none"
-                            />
+                        {!isEditing && (
+                          <div className="flex items-center gap-1 shrink-0 flex-wrap justify-end" onClick={(e) => e.stopPropagation()}>
+                            {onCompleteMissingFolder && fStats.incompleteFileCount > 0 && (
+                              <button
+                                type="button"
+                                onClick={() => onCompleteMissingFolder(folder.id)}
+                                disabled={isTranslating}
+                                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold bg-emerald-600 hover:bg-emerald-500 text-white shadow-xs disabled:opacity-40 transition-colors"
+                                title={isEn ? 'Complete ONLY missing/English lines in this folder' : 'تکمیل فقط خطوط باقی‌مانده و انگلیسی این پوشه'}
+                              >
+                                <Wand2 className="w-3 h-3" />
+                                <span>{isEn ? 'Complete' : 'تکمیل ترجمه'}</span>
+                              </button>
+                            )}
+                            {onRetranslateFolder && (
+                              <button
+                                type="button"
+                                onClick={() => onRetranslateFolder(folder.id)}
+                                disabled={isTranslating || folder.files.length === 0}
+                                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 dark:hover:bg-amber-900/60 text-amber-700 dark:text-amber-300 border border-amber-300/70 dark:border-amber-800 disabled:opacity-40 transition-colors"
+                                title={isEn ? 'Re-translate this folder (English -> Persian)' : 'ترجمه مجدد این پوشه (انگلیسی به فارسی)'}
+                              >
+                                <RotateCcw className="w-3 h-3" />
+                                <span>{isEn ? 'Re-translate' : 'ترجمه مجدد'}</span>
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => {
-                                if (editingName.trim()) {
-                                  onRenameFolder(folder.id, editingName.trim());
-                                }
-                                setEditingFolderId(null);
+                                setEditingFolderId(folder.id);
+                                setEditingName(folder.name);
                               }}
-                              className="p-1 text-emerald-500 hover:bg-emerald-500/10 rounded"
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-500 hover:bg-indigo-500/10 transition-colors"
+                              title={isEn ? 'Rename folder' : 'تغییر نام پوشه'}
                             >
-                              <Check className="w-3.5 h-3.5" />
+                              <Edit3 className="w-3.5 h-3.5" />
                             </button>
                             <button
                               type="button"
-                              onClick={() => setEditingFolderId(null)}
-                              className="p-1 text-slate-400 hover:bg-slate-500/10 rounded"
+                              onClick={() => onDeleteFolder(folder.id)}
+                              className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-colors"
+                              title={isEn ? 'Delete folder' : 'حذف پوشه'}
                             >
-                              <X className="w-3.5 h-3.5" />
+                              <Trash2 className="w-3.5 h-3.5" />
                             </button>
-                          </div>
-                        ) : (
-                          <div className="min-w-0 flex-1">
-                            <div className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate">
-                              {folder.name}
-                            </div>
-                            <div className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5">
-                              <span>{fStats.fileCount} {isEn ? 'files' : 'فایل'}</span>
-                              <span>•</span>
-                              <span>{fStats.totalLines} {t.linesCount}</span>
-                              {fStats.totalLines > 0 && (
-                                <>
-                                  <span>•</span>
-                                  <span className="text-emerald-600 dark:text-emerald-400 font-bold">
-                                    {fStats.pct}%
-                                  </span>
-                                </>
-                              )}
-                            </div>
                           </div>
                         )}
                       </div>
 
-                      {!isEditing && (
-                        <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
-                          {onRetranslateFolder && (
+                      {/* Separate download row on folder card for recently completed files */}
+                      {!isEditing && folderCompletedBatch.length > 0 && onBatchExportCompletedFiles && (
+                        <div
+                          className="flex items-center justify-between gap-2 pt-2 border-t border-emerald-500/25 text-[10px]"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <span className="text-emerald-700 dark:text-emerald-300 font-bold truncate">
+                            {isEn
+                              ? `Completed batch (${folderCompletedBatch.length} files):`
+                              : `دانلود فقط تکمیل‌شده‌ها (${folderCompletedBatch.length} فایل):`}
+                          </span>
+                          <div className="flex items-center gap-1 shrink-0">
                             <button
                               type="button"
-                              onClick={() => onRetranslateFolder(folder.id)}
-                              disabled={isTranslating || folder.files.length === 0}
-                              className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-bold bg-amber-50 hover:bg-amber-100 dark:bg-amber-950/40 dark:hover:bg-amber-900/60 text-amber-700 dark:text-amber-300 border border-amber-300/70 dark:border-amber-800 disabled:opacity-40 transition-colors"
-                              title={isEn ? 'Re-translate this folder (English -> Persian)' : 'ترجمه مجدد این پوشه (انگلیسی به فارسی)'}
+                              onClick={() => onBatchExportCompletedFiles(folder.id, 'srt')}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-bold transition-colors"
                             >
-                              <RotateCcw className="w-3 h-3" />
-                              <span>{isEn ? 'Re-translate' : 'ترجمه مجدد'}</span>
+                              <Download className="w-2.5 h-2.5" />
+                              <span>SRT</span>
                             </button>
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setEditingFolderId(folder.id);
-                              setEditingName(folder.name);
-                            }}
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-indigo-500 hover:bg-indigo-500/10 transition-colors"
-                            title={isEn ? 'Rename folder' : 'تغییر نام پوشه'}
-                          >
-                            <Edit3 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => onDeleteFolder(folder.id)}
-                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-500 hover:bg-rose-500/10 transition-colors"
-                            title={isEn ? 'Delete folder' : 'حذف پوشه'}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                            <button
+                              type="button"
+                              onClick={() => onBatchExportCompletedFiles(folder.id, 'vtt')}
+                              className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-teal-600 hover:bg-teal-500 text-white font-bold transition-colors"
+                            >
+                              <Download className="w-2.5 h-2.5" />
+                              <span>VTT</span>
+                            </button>
+                          </div>
                         </div>
                       )}
                     </div>
@@ -910,12 +1110,16 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                         <span className="text-[10px] font-mono font-bold text-slate-400 w-5 text-center shrink-0">
                           {idx + 1}
                         </span>
-                        <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
+                        {fStats.isDone ? (
+                          <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                        ) : (
+                          <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
+                        )}
                         <div className="min-w-0 flex-1">
                           <div className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate font-mono">
                             {file.fileName}
                           </div>
-                          <div className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400">
+                          <div className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 flex-wrap">
                             <span className="uppercase font-mono font-bold text-indigo-600 dark:text-indigo-400">
                               .{file.sourceFormat}
                             </span>
@@ -926,8 +1130,16 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                             {fStats.translated > 0 && (
                               <>
                                 <span>•</span>
-                                <span className="text-emerald-600 dark:text-emerald-400 font-bold">
-                                  {fStats.translated}/{fStats.total} {isEn ? 'done' : 'ترجمه‌شده'}
+                                <span className={`font-bold ${fStats.isDone ? 'text-emerald-600 dark:text-emerald-400' : 'text-amber-600 dark:text-amber-400'}`}>
+                                  {fStats.translated}/{fStats.total} ({fStats.pct}%)
+                                </span>
+                              </>
+                            )}
+                            {!fStats.isDone && fStats.missingCount > 0 && fStats.translated > 0 && (
+                              <>
+                                <span>•</span>
+                                <span className="text-rose-600 dark:text-rose-400 font-semibold">
+                                  {isEn ? `${fStats.missingCount} left` : `${fStats.missingCount} خط باقی‌مانده`}
                                 </span>
                               </>
                             )}

@@ -689,7 +689,7 @@ Tone: ${toneDescription}
 ${userCustomPrompt ? `Custom Instruction: "${userCustomPrompt}"` : ''}
 
 CRITICAL LOCALIZATION RULES:
-1. Translate ONLY the text fields. Retain all item IDs and ordering.
+1. STRICT 1:1 TIMING & ID ALIGNMENT: Translate ONLY the text fields. Retain all item IDs and ordering 1:1. NEVER merge two consecutive subtitle items into one, NEVER shift dialogue across different IDs, NEVER emit blank lines (double newlines) or "-->" inside any translated text, and NEVER leave English lines untranslated into ${targetLanguage}.
 2. VARIABLE & TAG ISOLATION: Retain tags (<i>, <b>, {\\pos(...)}), system variables ({player_name}, %s, $amount, [TAG]) exactly without translation or modification.
 3. UNCENSORED FIDELITY: When the tone is 'expose', 'humorous', 'conversational', or 'epic', translate every statement, exposé claim, profanity, slang, and sensitive expression directly and authentically with zero censorship, softening, or omission.
 4. OUTPUT FORMAT: Respond ONLY with a valid JSON object matching this schema:
@@ -1066,10 +1066,10 @@ User Custom Instruction: "${userCustomPrompt || 'None'}"
 ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue, UI, Quests, Items, Lore)' : 'Operational Mode: Movie & TV Subtitles (Cinema Engine)'}
 
 [CRITICAL CONSTRAINTS - DO NOT VIOLATE]
-1. PRESERVE STRUCTURE:
-   - For Movies: NEVER alter or omit any timecode, index number, or line spacing.
+1. PRESERVE STRUCTURE & 1:1 TIMING LOCK:
+   - For Movies: NEVER alter or omit any timecode, index number, or line spacing. Keep strict 1:1 alignment between each input "id" and its corresponding output "id". NEVER shift text from one ID to an adjacent ID, NEVER merge two lines, and NEVER insert empty blank lines (\\n\\n) or "-->" inside a subtitle line.
    - For Games: NEVER alter JSON keys, CSV separators, or structural IDs. Translate ONLY the target text fields.
-   - You MUST translate every single input item provided in the array. Do NOT omit, combine, or skip any item IDs. Every item in input MUST have a matching object in the "translations" array.
+   - You MUST translate EVERY SINGLE non-empty input item into ${targetLanguage}. Do NOT omit, skip, return empty strings, or leave source English text untranslated. Every item in input MUST have a matching object in the "translations" array.
 
 2. VARIABLE & TAG ISOLATION (STRICT RULE FOR GAMES AND SUBTITLES):
    - You MUST NOT translate, modify, or corrupt any code variables, formatting tags, or placeholders.
@@ -1166,7 +1166,51 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
       parsedData.exhaustedKeyIndices = exhaustedKeyIndices;
       parsedData.invalidKeyIndices = invalidKeyIndices;
 
-      // Strict integrity check: Ensure every input item is mapped to an output translation
+      // Strict integrity check: Ensure every input item is mapped, non-empty, and actually translated into targetLanguage
+      const NON_LATIN_SCRIPT_MAP: Record<string, RegExp> = {
+        fa: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
+        ar: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
+        ur: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
+        ps: /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/,
+        he: /[\u0590-\u05FF]/,
+        ru: /[\u0400-\u04FF]/,
+        uk: /[\u0400-\u04FF]/,
+        ja: /[\u3040-\u30FF\u4E00-\u9FFF]/,
+        ko: /[\uAC00-\uD7AF\u1100-\u11FF]/,
+        zh: /[\u4E00-\u9FFF]/,
+        'zh-cn': /[\u4E00-\u9FFF]/,
+        'zh-tw': /[\u4E00-\u9FFF]/,
+        hi: /[\u0900-\u097F]/,
+        th: /[\u0E00-\u0E7F]/,
+      };
+      const cleanForCheck = (s: string) =>
+        String(s || '')
+          .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\{\\[^}]+\}/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+      const targetScriptRegex = NON_LATIN_SCRIPT_MAP[String(targetLanguage || '').toLowerCase().trim()];
+
+      const isLeftUntranslated = (origText: string, transText: string): boolean => {
+        const cleanOrig = cleanForCheck(origText);
+        if (!cleanOrig || !/[A-Za-z\u00C0-\u024F\u0400-\u04FF\u0600-\u06FF\u4E00-\u9FFF\u3040-\u30FF\uAC00-\uD7AF]/.test(cleanOrig)) {
+          return false;
+        }
+        const cleanTrans = cleanForCheck(transText);
+        if (!cleanTrans) return true;
+        if (targetScriptRegex && !targetScriptRegex.test(cleanTrans)) {
+          const latinLetters = (cleanTrans.match(/[A-Za-z]/g) || []).length;
+          const latinWords = (cleanTrans.match(/[A-Za-z]{2,}/g) || []).length;
+          if (cleanTrans.toLowerCase() === cleanOrig.toLowerCase() && latinLetters >= 3) {
+            const isShortAcronym = /^[A-Z0-9.\-!?]{2,4}$/.test(cleanOrig);
+            if (!isShortAcronym) return true;
+          }
+          if (latinWords >= 2 || latinLetters >= 6) return true;
+        }
+        return false;
+      };
+
       const rawTranslations = Array.isArray(parsedData.translations) ? parsedData.translations : [];
       const translationMap = new Map<number, string>();
       rawTranslations.forEach((t: any) => {
@@ -1175,32 +1219,42 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
         }
       });
 
-      const missingIds: number[] = [];
-      const verifiedTranslations = items.map((inputItem: any) => {
-        if (!translationMap.has(inputItem.id)) {
-          missingIds.push(inputItem.id);
+      const hardMissingIds: number[] = [];
+      const untranslatedIds: number[] = [];
+      items.forEach((inputItem: any) => {
+        const cleanOrig = cleanForCheck(inputItem.text);
+        const hasEntry = translationMap.has(inputItem.id);
+        const mappedText = hasEntry ? translationMap.get(inputItem.id)! : '';
+        if (!hasEntry || (cleanOrig.length > 0 && !cleanForCheck(mappedText))) {
+          hardMissingIds.push(inputItem.id);
+        } else if (isLeftUntranslated(inputItem.text, mappedText)) {
+          untranslatedIds.push(inputItem.id);
         }
-        return {
-          id: inputItem.id,
-          text: translationMap.has(inputItem.id) ? translationMap.get(inputItem.id)! : '',
-        };
       });
 
-      if (missingIds.length > 0) {
-        // FIX (B19): instead of throwing the WHOLE batch away (client retried 3× = 3× token
-        // cost and still lost everything), we run ONE targeted repair call containing ONLY the
-        // missing ids. Only if even the repair pass is incomplete do we fail the batch.
-        const missingItems = items.filter((inputItem: any) => missingIds.includes(inputItem.id));
-        let repaired = false;
+      const idsToRepair = Array.from(new Set([...hardMissingIds, ...untranslatedIds]));
+
+      if (idsToRepair.length > 0) {
+        // FIX (B19 + Incomplete English Repair): run ONE targeted repair call containing ONLY the
+        // missing, empty, or untranslated English ids so batches reach 100% without wasting tokens.
+        const repairItems = items.filter((inputItem: any) => idsToRepair.includes(inputItem.id));
+        let hardRepaired = hardMissingIds.length === 0;
         try {
-          const repairPrompt = `The previous translation pass missed ${missingItems.length} item(s). Translate ONLY the following ${missingItems.length} ${mode === 'game' ? 'game strings' : 'subtitle lines'} into ${targetLanguage}. Return a JSON object {"translations":[{"id":number,"text":string}]} covering exactly these ids:\n` +
-            JSON.stringify(missingItems, null, 2);
+          const repairPrompt = `The previous translation pass missed or left untranslated ${repairItems.length} item(s). Translate EVERY SINGLE ONE strictly into ${targetLanguage} (do NOT return empty strings and do NOT leave English sentences untranslated). Keep strict 1:1 ID matching. Return a JSON object {"translations":[{"id":number,"text":string}]} covering exactly these ids:\n` +
+            JSON.stringify(repairItems, null, 2);
 
           const { response: repairResponse } = await callGeminiWithRetryAndFallback(apiKeys, {
             contents: repairPrompt,
             config: {
               systemInstruction,
               responseMimeType: 'application/json',
+              safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE },
+              ],
               responseSchema: {
                 type: Type.OBJECT,
                 properties: {
@@ -1224,23 +1278,35 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
           const repairParsed = JSON.parse(repairResponse.text || '{}');
           const repairList = Array.isArray(repairParsed.translations) ? repairParsed.translations : [];
           repairList.forEach((t: any) => {
-            if (t && typeof t.id === 'number' && !translationMap.has(t.id)) {
-              translationMap.set(t.id, String(t.text ?? ''));
+            if (t && typeof t.id === 'number') {
+              const repairedText = String(t.text ?? '');
+              if (repairedText.trim().length > 0 || !translationMap.has(t.id)) {
+                translationMap.set(t.id, repairedText);
+              }
             }
           });
 
-          const stillMissing = missingIds.filter((id) => !translationMap.has(id));
-          if (stillMissing.length === 0) {
-            repaired = true;
-            console.warn(`[Translate] ${requestId}: ${missingIds.length} missing line(s) recovered via targeted repair pass.`);
+          const stillHardMissing = hardMissingIds.filter((id) => {
+            const orig = items.find((it: any) => it.id === id);
+            const cleanOrig = cleanForCheck(orig?.text || '');
+            if (!translationMap.has(id)) return true;
+            return cleanOrig.length > 0 && !cleanForCheck(translationMap.get(id) || '');
+          });
+          if (stillHardMissing.length === 0) {
+            hardRepaired = true;
+            console.warn(`[Translate] ${requestId}: ${idsToRepair.length} missing/untranslated line(s) recovered via targeted repair pass.`);
           }
         } catch (repairErr: any) {
           if (repairErr?.isClientAbort || repairErr?.message?.startsWith('CLIENT_ABORTED')) throw repairErr;
           console.warn(`[Translate] ${requestId}: repair pass failed:`, repairErr?.message || repairErr);
         }
 
-        if (!repaired) {
-          const finalMissing = items.filter((inputItem: any) => !translationMap.has(inputItem.id)).map((i: any) => i.id);
+        if (!hardRepaired) {
+          const finalMissing = hardMissingIds.filter((id) => {
+            const orig = items.find((it: any) => it.id === id);
+            const cleanOrig = cleanForCheck(orig?.text || '');
+            return !translationMap.has(id) || (cleanOrig.length > 0 && !cleanForCheck(translationMap.get(id) || ''));
+          });
           return res.status(502).json({
             success: false,
             error: `مدل هوش مصنوعی ${finalMissing.length} سطر را ترجمه نکرده است.`,

@@ -281,6 +281,8 @@ export interface SubtitleFolder {
   createdAt: number;
   updatedAt: number;
   files: SubtitleFolderFile[];
+  lastCompletedFileIds?: string[];
+  lastCompletedAt?: number;
 }
 
 

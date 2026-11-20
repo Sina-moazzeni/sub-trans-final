@@ -3,6 +3,7 @@ import { SubtitleItem, BilingualConfig, AppMode } from '../types';
 import { UILanguage, Translations } from '../lib/i18n';
 import { wrapText, sanitizeTranslation } from '../lib/bilingualHelper';
 import { extractGameVariables } from '../lib/gameLocalizationParser';
+import { toEnglishDigits } from '../lib/subtitleParser';
 import { 
   Sparkles, 
   Copy, 
@@ -97,23 +98,27 @@ export const SubtitleRowItem = React.memo<SubtitleRowItemProps>(({
           </div>
 
           {!isGame ? (
-            <div className="flex flex-col gap-1 text-[10px] font-mono text-slate-500 dark:text-slate-400">
+            <div dir="ltr" lang="en" className="flex flex-col gap-1 text-[10px] font-['JetBrains_Mono',monospace] tabular-nums text-slate-500 dark:text-slate-400 [unicode-bidi:isolate]">
               <div className="flex items-center gap-1">
-                <Clock className="w-3 h-3 text-slate-400 dark:text-slate-500" />
+                <Clock className="w-3 h-3 text-slate-400 dark:text-slate-500 shrink-0" />
                 <input
                   type="text"
-                  value={item.startTime}
-                  onChange={(e) => onSourceItemChange && onSourceItemChange(item.id, 'startTime', e.target.value)}
-                  className="bg-transparent border-b border-dashed border-slate-300 dark:border-slate-700 focus:border-blue-500 focus:outline-none w-20 text-center text-[10px] text-slate-800 dark:text-slate-200"
+                  dir="ltr"
+                  lang="en"
+                  value={toEnglishDigits(item.startTime)}
+                  onChange={(e) => onSourceItemChange && onSourceItemChange(item.id, 'startTime', toEnglishDigits(e.target.value))}
+                  className="bg-transparent border-b border-dashed border-slate-300 dark:border-slate-700 focus:border-blue-500 focus:outline-none w-24 text-left text-[10px] font-['JetBrains_Mono',monospace] tabular-nums text-slate-800 dark:text-slate-200"
                 />
               </div>
               <div className="flex items-center gap-1">
-                <span className="text-slate-400">→</span>
+                <span className="text-slate-400 shrink-0">→</span>
                 <input
                   type="text"
-                  value={item.endTime}
-                  onChange={(e) => onSourceItemChange && onSourceItemChange(item.id, 'endTime', e.target.value)}
-                  className="bg-transparent border-b border-dashed border-slate-300 dark:border-slate-700 focus:border-blue-500 focus:outline-none w-20 text-center text-[10px] text-slate-800 dark:text-slate-200"
+                  dir="ltr"
+                  lang="en"
+                  value={toEnglishDigits(item.endTime)}
+                  onChange={(e) => onSourceItemChange && onSourceItemChange(item.id, 'endTime', toEnglishDigits(e.target.value))}
+                  className="bg-transparent border-b border-dashed border-slate-300 dark:border-slate-700 focus:border-blue-500 focus:outline-none w-24 text-left text-[10px] font-['JetBrains_Mono',monospace] tabular-nums text-slate-800 dark:text-slate-200"
                 />
               </div>
             </div>

@@ -10,11 +10,23 @@ export function detectEncodingAndDecode(buffer: ArrayBuffer, forcedEncoding?: st
 }
 
 /**
+ * Normalize Persian (۰-۹) and Arabic-Indic (٠-٩) digits to strict ASCII English digits (0-9)
+ * and strip directional/invisible bidi control marks so timestamps are always machine-readable.
+ */
+export function toEnglishDigits(input: string): string {
+  if (!input) return '';
+  return input
+    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06f0))
+    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '');
+}
+
+/**
  * Convert timestamp (e.g. "00:01:20,500" or "00:01:20.500" or "0:01:20.50") to seconds
  */
 export function timestampToSeconds(timeStr: string): number {
   if (!timeStr) return 0;
-  const cleaned = timeStr.trim().replace(',', '.');
+  const cleaned = toEnglishDigits(timeStr).trim().replace(',', '.');
   const parts = cleaned.split(':');
   if (parts.length === 3) {
     const hours = parseFloat(parts[0]) || 0;
@@ -100,7 +112,7 @@ export function secondsToASS(seconds: number): string {
  */
 function parseTimestampParts(raw?: string): { h: number; m: number; s: number; ms: number } | null {
   if (!raw) return null;
-  const cleaned = raw.trim();
+  const cleaned = toEnglishDigits(raw).trim();
   const match = cleaned.match(/^(\d{1,4}):(\d{1,2}):(\d{1,2})(?:[.,](\d+))?$/);
   if (match) {
     let h = parseInt(match[1], 10);
@@ -260,7 +272,7 @@ function parseSRT(content: string): { items: SubtitleItem[]; format: SubtitleFor
   const text = content.trim();
   const items: SubtitleItem[] = [];
 
-  const timestampRegex = /(\d{1,2}:\d{2}:\d{2}[.,]\d{2,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{2,3})/g;
+  const timestampRegex = /^[ \t]*([0-9\u06F0-\u06F9\u0660-\u0669]{1,4}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}(?:[.,][0-9\u06F0-\u06F9\u0660-\u0669]{1,6})?)[ \t]*-->[ \t]*([0-9\u06F0-\u06F9\u0660-\u0669]{1,4}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}(?:[.,][0-9\u06F0-\u06F9\u0660-\u0669]{1,6})?)[^\n]*/gm;
   
   const matches: { index: number; startStr: string; endStr: string; fullMatch: string }[] = [];
   let match: RegExpExecArray | null;
@@ -268,8 +280,8 @@ function parseSRT(content: string): { items: SubtitleItem[]; format: SubtitleFor
   while ((match = timestampRegex.exec(text)) !== null) {
     matches.push({
       index: match.index,
-      startStr: match[1],
-      endStr: match[2],
+      startStr: toEnglishDigits(match[1]),
+      endStr: toEnglishDigits(match[2]),
       fullMatch: match[0],
     });
   }
@@ -316,11 +328,11 @@ function parseSRT(content: string): { items: SubtitleItem[]; format: SubtitleFor
         textLines.pop();
       }
       // Trailing all-digits line immediately before the next timestamp is the next cue's index
-      // if it matches expected sequence (i + 2) OR is separated by a blank line (handles skipped cue numbers in English SRTs).
-      if (textLines.length > 0 && /^\d+$/.test(textLines[textLines.length - 1].trim())) {
-        const trailingNumber = parseInt(textLines[textLines.length - 1].trim(), 10);
+      // if it matches expected sequence OR is separated by a blank line (handles skipped cue numbers in English SRTs).
+      if (textLines.length > 0 && /^[0-9\u06F0-\u06F9\u0660-\u0669]+$/.test(textLines[textLines.length - 1].trim())) {
+        const trailingNumber = parseInt(toEnglishDigits(textLines[textLines.length - 1].trim()), 10);
         const hasBlankLineAbove = textLines.length >= 2 && textLines[textLines.length - 2].trim() === '';
-        if (trailingNumber === i + 2 || hasBlankLineAbove) {
+        if (trailingNumber === i + 2 || trailingNumber === items.length + 2 || hasBlankLineAbove) {
           textLines.pop();
         }
       }
@@ -331,11 +343,12 @@ function parseSRT(content: string): { items: SubtitleItem[]; format: SubtitleFor
     const rawStart = timestampToSeconds(current.startStr);
     const rawEnd = timestampToSeconds(current.endStr);
     const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
+    const endWasFixed = rawEnd < rawStart;
 
     items.push({
       id: items.length + 1,
       startTime: normalizeTimestampToSRT(current.startStr, startSec),
-      endTime: normalizeTimestampToSRT(current.endStr, endSec),
+      endTime: endWasFixed ? secondsToSRT(endSec) : normalizeTimestampToSRT(current.endStr, endSec),
       startSeconds: startSec,
       endSeconds: endSec,
       originalText: cleanedText,
@@ -392,7 +405,7 @@ function parseSRTFallback(text: string): { items: SubtitleItem[]; format: Subtit
  * item as `cueId` so the export can restore them.
  */
 const isVttTimestampLine = (raw: string): boolean => {
-  const trimmed = raw.trim();
+  const trimmed = toEnglishDigits(raw).trim();
   return /^(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?\s*-->\s*(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?(?:\s+.*)?$/.test(trimmed);
 };
 
@@ -427,13 +440,13 @@ function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFor
       // If currentBlock ALREADY has a cue timestamp, flush the prior cue first so back-to-back cues
       // without a separating blank line never merge together or drop cue #2's timestamps!
       if (currentBlock.some((l) => isVttTimestampLine(l))) {
-        const lastLine = currentBlock[currentBlock.length - 1]?.trim() || '';
+        const lastLine = toEnglishDigits(currentBlock[currentBlock.length - 1] || '').trim();
         const looksLikeCueId =
-          currentBlock.length >= 2 &&
+          currentBlock.length >= 3 &&
           !isVttTimestampLine(lastLine) &&
-          (/^[\d]+$/.test(lastLine) || /^[A-Za-z0-9_.-]{1,32}$/.test(lastLine));
+          (/^\d+$/.test(lastLine) || /^(?:cue|c|id|sub)[-_]?\d+$/i.test(lastLine) || /^[A-Za-z0-9]+[-_][A-Za-z0-9_.-]+$/.test(lastLine));
 
-        if (looksLikeCueId && currentBlock.length >= 3) {
+        if (looksLikeCueId) {
           const carriedCueId = currentBlock.pop()!;
           processVTTBlock(currentBlock, autoId++, items);
           currentBlock = [carriedCueId];
@@ -529,12 +542,12 @@ function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
   const parts = timeLine.split('-->');
   if (parts.length < 2) return;
 
-  const startPart = parts[0].trim();
+  const startPart = toEnglishDigits(parts[0]).trim();
   const endWithSettings = parts[1].trim();
 
   // WebVTT settings follow after end timestamp e.g. "00:01:25.000 line:0 position:20% align:start"
   const endTokens = endWithSettings.split(/\s+/);
-  const endPart = endTokens[0];
+  const endPart = toEnglishDigits(endTokens[0] || '').trim();
   const settings = endTokens.slice(1).join(' ');
 
   const textLines = lines.slice(timeLineIdx + 1).join('\n').trim();
@@ -546,11 +559,12 @@ function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
   const rawStart = timestampToSeconds(startPart);
   const rawEnd = timestampToSeconds(endPart);
   const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
+  const endWasFixed = rawEnd < rawStart;
 
   items.push({
     id,
     startTime: normalizeTimestampToVTT(startPart, startSec),
-    endTime: normalizeTimestampToVTT(endPart, endSec),
+    endTime: endWasFixed ? secondsToVTT(endSec) : normalizeTimestampToVTT(endPart, endSec),
     startSeconds: startSec,
     endSeconds: endSec,
     originalText: textLines,
@@ -851,12 +865,24 @@ export function exportSubtitleFile(
   }
 }
 
+/**
+ * Sanitize cue payload for SRT/VTT so internal blank lines or "-->" never break cue boundaries in players.
+ */
+function sanitizeCuePayloadText(raw: string): string {
+  return (raw || '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/\n[ \t]*\n+/g, '\n')
+    .replace(/-->/g, '->')
+    .trim();
+}
+
 function exportSRT(items: SubtitleItem[]): string {
   return items
     .map((item, index) => {
-      const text = item.translatedText.trim() || item.originalText.trim();
-      const start = normalizeTimestampToSRT(item.startTime, item.startSeconds);
-      const end = normalizeTimestampToSRT(item.endTime, item.endSeconds);
+      const text = sanitizeCuePayloadText(item.translatedText.trim() || item.originalText.trim());
+      const start = toEnglishDigits(normalizeTimestampToSRT(item.startTime, item.startSeconds));
+      const end = toEnglishDigits(normalizeTimestampToSRT(item.endTime, item.endSeconds));
       return `${index + 1}\n${start} --> ${end}\n${text}\n`;
     })
     .join('\n');
@@ -879,12 +905,13 @@ function exportVTT(items: SubtitleItem[], rawHeader?: string): string {
   const header = cleanedHeader.startsWith('WEBVTT') ? cleanedHeader : 'WEBVTT';
   const body = items
     .map((item) => {
-      const text = item.translatedText.trim() || item.originalText.trim();
-      const start = normalizeTimestampToVTT(item.startTime, item.startSeconds);
-      const end = normalizeTimestampToVTT(item.endTime, item.endSeconds);
+      const text = sanitizeCuePayloadText(item.translatedText.trim() || item.originalText.trim());
+      const start = toEnglishDigits(normalizeTimestampToVTT(item.startTime, item.startSeconds));
+      const end = toEnglishDigits(normalizeTimestampToVTT(item.endTime, item.endSeconds));
       const settingsStr = isValidVttCueSettings(item.styleTags) ? ` ${item.styleTags!.trim()}` : '';
-      // FIX (L9): restore the cue identifier when the source file had one
-      const idStr = item.cueId ? `${item.cueId}\n` : '';
+      // FIX (L9): restore the cue identifier when the source file had one (ASCII-safe, never containing -->)
+      const safeCueId = item.cueId && !item.cueId.includes('-->') ? toEnglishDigits(item.cueId).trim() : '';
+      const idStr = safeCueId ? `${safeCueId}\n` : '';
       return `${idStr}${start} --> ${end}${settingsStr}\n${text}\n`;
     })
     .join('\n');

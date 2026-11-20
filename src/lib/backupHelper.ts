@@ -1,4 +1,6 @@
 import { SubtitleFolder, SubtitleFolderFile, SubtitleFormat, SubtitleItem } from '../types';
+import { toEnglishDigits } from './subtitleParser';
+import { getFileCompletionStats } from './translationCompleteness';
 
 export interface SubtitlesBackupPayload {
   app: 'SubGameLab';
@@ -31,8 +33,8 @@ function sanitizeSubtitleItem(raw: any, fallbackIndex: number): SubtitleItem {
   const id = typeof raw?.id === 'number' && !isNaN(raw.id) ? raw.id : fallbackIndex + 1;
   return {
     id,
-    startTime: typeof raw?.startTime === 'string' ? raw.startTime : '00:00:00,000',
-    endTime: typeof raw?.endTime === 'string' ? raw.endTime : '00:00:05,000',
+    startTime: typeof raw?.startTime === 'string' ? toEnglishDigits(raw.startTime) : '00:00:00,000',
+    endTime: typeof raw?.endTime === 'string' ? toEnglishDigits(raw.endTime) : '00:00:05,000',
     startSeconds: typeof raw?.startSeconds === 'number' && !isNaN(raw.startSeconds) ? raw.startSeconds : 0,
     endSeconds: typeof raw?.endSeconds === 'number' && !isNaN(raw.endSeconds) ? raw.endSeconds : 5,
     originalText: typeof raw?.originalText === 'string' ? raw.originalText : String(raw?.originalText ?? ''),
@@ -43,7 +45,7 @@ function sanitizeSubtitleItem(raw: any, fallbackIndex: number): SubtitleItem {
     gameKey: typeof raw?.gameKey === 'string' ? raw.gameKey : undefined,
     context: typeof raw?.context === 'string' ? raw.context : undefined,
     variables: Array.isArray(raw?.variables) ? raw.variables : undefined,
-    rawRowData: raw?.rawRowData && typeof raw.rawRowData === 'object' ? raw.rawRowData : undefined,
+    rawRowData: raw?.rawRowData && typeof raw?.rawRowData === 'object' ? raw.rawRowData : undefined,
   };
 }
 
@@ -53,9 +55,8 @@ function sanitizeFolderFile(raw: any, idx: number): SubtitleFolderFile | null {
   const items: SubtitleItem[] = rawItems.map((it: any, i: number) => sanitizeSubtitleItem(it, i));
   const validFormats = new Set<SubtitleFormat>(['srt', 'vtt', 'ass', 'ssa', 'sub']);
   const format: SubtitleFormat = validFormats.has(raw.sourceFormat) ? raw.sourceFormat : 'srt';
-  const allDone = items.length > 0 && items.every((it) => it.translatedText && it.translatedText.trim().length > 0);
 
-  return {
+  const sanitizedFile: SubtitleFolderFile = {
     id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : `file_${Date.now().toString(36)}_${idx}`,
     fileName: typeof raw.fileName === 'string' && raw.fileName.trim() ? raw.fileName.trim() : `Subtitle_${idx + 1}.${format}`,
     fileSize: typeof raw.fileSize === 'number' ? raw.fileSize : 0,
@@ -64,10 +65,13 @@ function sanitizeFolderFile(raw: any, idx: number): SubtitleFolderFile | null {
     detectedEncoding: typeof raw.detectedEncoding === 'string' ? raw.detectedEncoding : 'UTF-8',
     subFps: typeof raw.subFps === 'number' ? raw.subFps : 25,
     items,
-    status: allDone ? 'done' : 'pending',
+    status: 'pending',
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
     assignedKeyId: typeof raw.assignedKeyId === 'string' ? raw.assignedKeyId : undefined,
   };
+  const stats = getFileCompletionStats(sanitizedFile, 'fa');
+  sanitizedFile.status = stats.isDone ? 'done' : 'pending';
+  return sanitizedFile;
 }
 
 export function parseAndValidateBackupJson(rawText: string): {
@@ -111,12 +115,19 @@ export function parseAndValidateBackupJson(rawText: string): {
       }
     });
 
+    const validFileIds = new Set(files.map((fl) => fl.id));
+    const restoredCompletedIds = Array.isArray(rf.lastCompletedFileIds)
+      ? rf.lastCompletedFileIds.filter((fid: any) => typeof fid === 'string' && validFileIds.has(fid))
+      : undefined;
+
     folders.push({
       id: typeof rf.id === 'string' && rf.id.trim() ? rf.id.trim() : `fld_${Date.now().toString(36)}_${fIdx}`,
       name: typeof rf.name === 'string' && rf.name.trim() ? rf.name.trim() : `پوشه بازیابی شده ${fIdx + 1}`,
       createdAt: typeof rf.createdAt === 'number' ? rf.createdAt : Date.now(),
       updatedAt: typeof rf.updatedAt === 'number' ? rf.updatedAt : Date.now(),
       files,
+      lastCompletedFileIds: restoredCompletedIds && restoredCompletedIds.length > 0 ? restoredCompletedIds : undefined,
+      lastCompletedAt: typeof rf.lastCompletedAt === 'number' ? rf.lastCompletedAt : undefined,
     });
   });
 

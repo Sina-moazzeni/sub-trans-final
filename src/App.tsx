@@ -37,8 +37,14 @@ import {
   fixRTLPunctuation,
   timestampToSeconds,
   secondsToSRT,
+  toEnglishDigits,
   RTL_LANGUAGES
 } from './lib/subtitleParser';
+import {
+  isItemTranslationIncomplete,
+  getFileCompletionStats,
+  getFolderCompletionStats,
+} from './lib/translationCompleteness';
 import { createZipBlob } from './lib/zipHelper';
 import { 
   parseGameLocalizationFile,
@@ -331,11 +337,16 @@ export default function App() {
   // Modals & Notifications
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
 
-  // Calculate overall translation completion stats
-  const translatedItemsCount = items.filter((item) => item.translatedText && item.translatedText.trim().length > 0).length;
+  // Calculate overall translation completion stats (empty cues don't block 100%; leftover English lines are caught)
+  const translatedItemsCount = items.filter((item) => !isItemTranslationIncomplete(item, targetLanguage)).length;
   const totalItemsCount = items.length;
   const isFullyTranslated = totalItemsCount > 0 && translatedItemsCount === totalItemsCount;
-  const completionPercentage = totalItemsCount > 0 ? Math.round((translatedItemsCount / totalItemsCount) * 100) : 0;
+  const completionPercentage =
+    totalItemsCount === 0
+      ? 0
+      : isFullyTranslated
+        ? 100
+        : Math.min(99, Math.floor((translatedItemsCount / totalItemsCount) * 100));
 
   const cancelTranslationRef = useRef<boolean>(false);
   const isPausedRef = useRef<boolean>(false);
@@ -666,7 +677,7 @@ export default function App() {
     if (!currentFolder || !currentFile) return;
     if (currentFile.items === items) return;
 
-    const allTranslated = items.length > 0 && items.every((it) => it.translatedText && it.translatedText.trim().length > 0);
+    const allTranslated = items.length > 0 && items.every((it) => !isItemTranslationIncomplete(it, targetLanguage));
     const updatedFile: SubtitleFolderFile = {
       ...currentFile,
       items,
@@ -681,7 +692,7 @@ export default function App() {
     foldersRef.current = foldersRef.current.map((f) => (f.id === activeFolderId ? updatedFolder : f));
     setFolders((prev) => prev.map((f) => (f.id === activeFolderId ? updatedFolder : f)));
     void saveFolderToDb(updatedFolder);
-  }, [items, mode, activeFolderId, activeFileId, translatingFileId]);
+  }, [items, mode, activeFolderId, activeFileId, translatingFileId, targetLanguage]);
 
   // Auto-save session debounced when items or parameters change
   useEffect(() => {
@@ -1065,26 +1076,27 @@ export default function App() {
     return { removedCount, exhaustedCount };
   };
 
-  // Source item modification handler
+  // Source item modification handler (strictly keeps timestamps in English ASCII digits)
   const handleSourceItemChange = (id: number, field: 'originalText' | 'startTime' | 'endTime', value: string) => {
+    const cleanValue = field === 'startTime' || field === 'endTime' ? toEnglishDigits(value) : value;
     setItems((prev) =>
       prev.map((item) => {
         if (item.id === id) {
-          const isTextChanged = field === 'originalText' && value !== item.originalText;
+          const isTextChanged = field === 'originalText' && cleanValue !== item.originalText;
           let newStartSec = item.startSeconds;
           let newEndSec = item.endSeconds;
 
           if (field === 'startTime') {
-            const parsedSec = timestampToSeconds(value);
+            const parsedSec = timestampToSeconds(cleanValue);
             if (!isNaN(parsedSec)) newStartSec = parsedSec;
           } else if (field === 'endTime') {
-            const parsedSec = timestampToSeconds(value);
+            const parsedSec = timestampToSeconds(cleanValue);
             if (!isNaN(parsedSec)) newEndSec = parsedSec;
           }
 
           return {
             ...item,
-            [field]: value,
+            [field]: cleanValue,
             startSeconds: newStartSec,
             endSeconds: newEndSec,
             sourceModified: isTextChanged ? true : item.sourceModified,
@@ -2410,10 +2422,11 @@ export default function App() {
     }
   };
 
-  // Concurrent Multi-File Translation Engine with Per-File Dedicated Keys, RPM Rate-Limiting & Daily Quota Failover
+  // Concurrent Multi-File Translation Engine with Per-File Dedicated Keys, RPM Rate-Limiting,
+  // Daily Quota Failover, Missing-Only Completion Pass, and Automatic Final Self-Healing Repair
   const handleTranslateFilesConcurrently = async (
     explicitFileIds?: string[],
-    options?: { targetFolderId?: string; forceRetranslate?: boolean }
+    options?: { targetFolderId?: string; forceRetranslate?: boolean; missingOnly?: boolean }
   ) => {
     if (isTranslatingRef.current) return;
     const targetFolderId = options?.targetFolderId || activeFolderIdRef.current;
@@ -2448,6 +2461,12 @@ export default function App() {
       }
     }
 
+    const effectiveSourceLang =
+      (options?.forceRetranslate || options?.missingOnly) && sourceLanguage === 'auto'
+        ? 'en'
+        : sourceLanguage;
+    const effectiveTargetLang = targetLanguage || 'fa';
+
     // Activate target folder and clear existing translations when forceRetranslate is requested
     if (options?.forceRetranslate) {
       const resetFiles: SubtitleFolderFile[] = folder.files.map((fl) => {
@@ -2463,6 +2482,8 @@ export default function App() {
         ...folder,
         updatedAt: Date.now(),
         files: resetFiles,
+        lastCompletedFileIds: undefined,
+        lastCompletedAt: undefined,
       };
       foldersRef.current = foldersRef.current.map((f) => (f.id === resetFolder.id ? resetFolder : f));
       setFolders(foldersRef.current);
@@ -2484,13 +2505,32 @@ export default function App() {
     }
 
     let filesQueue: SubtitleFolderFile[];
-    if (explicitFileIds && explicitFileIds.length > 0) {
+    if (options?.missingOnly) {
+      const candidateFiles =
+        explicitFileIds && explicitFileIds.length > 0
+          ? folder.files.filter((fl) => explicitFileIds.includes(fl.id))
+          : folder.files;
+      filesQueue = candidateFiles.filter(
+        (fl) => getFileCompletionStats(fl, effectiveTargetLang).missingCount > 0
+      );
+      if (filesQueue.length === 0) {
+        showToast(
+          uiLang === 'en'
+            ? 'All files in this folder are already 100% translated!'
+            : 'تمام زیرنویس‌های این پوشه ۱۰۰٪ تکمیل هستند!',
+          'success'
+        );
+        return;
+      }
+    } else if (explicitFileIds && explicitFileIds.length > 0) {
       const idSet = new Set(explicitFileIds);
       filesQueue = folder.files.filter((fl) => idSet.has(fl.id));
     } else if (options?.forceRetranslate) {
       filesQueue = folder.files;
     } else {
-      const filesPending = folder.files.filter((fl) => fl.items.some((it) => !it.translatedText?.trim()));
+      const filesPending = folder.files.filter(
+        (fl) => getFileCompletionStats(fl, effectiveTargetLang).missingCount > 0
+      );
       filesQueue = filesPending.length > 0 ? filesPending : folder.files;
     }
 
@@ -2499,10 +2539,40 @@ export default function App() {
       return;
     }
 
+    // Activate target folder & enter translation view for missing-only completion so progress & download banner are visible
+    if (options?.missingOnly) {
+      if (activeFolderIdRef.current !== folder.id) {
+        setActiveFolderId(folder.id);
+        activeFolderIdRef.current = folder.id;
+      }
+      const firstIncomplete = filesQueue[0];
+      if (firstIncomplete && activeFileIdRef.current !== firstIncomplete.id) {
+        setActiveFileId(firstIncomplete.id);
+        activeFileIdRef.current = firstIncomplete.id;
+        loadFolderFileIntoEditor(firstIncomplete);
+      }
+      setInTranslationView(true);
+    }
+
     const BATCH_SIZE = batchSize || 35;
-    const totalLinesAcrossQueue = filesQueue.reduce((sum, fl) => sum + fl.items.length, 0);
+
+    // Determine exact per-file target items (missing-only for partial/completion runs; all items for fresh/retranslate)
+    const getItemsForFilePass = (fl: SubtitleFolderFile): SubtitleItem[] => {
+      if (options?.forceRetranslate) return fl.items;
+      const stats = getFileCompletionStats(fl, effectiveTargetLang);
+      if (options?.missingOnly || (stats.completed > 0 && stats.missingCount > 0)) {
+        const missingSet = new Set(stats.missingItemIds);
+        return fl.items.filter((it) => missingSet.has(it.id));
+      }
+      return fl.items;
+    };
+
+    const totalLinesAcrossQueue = filesQueue.reduce(
+      (sum, fl) => sum + getItemsForFilePass(fl).length,
+      0
+    );
     const totalBatchesAcrossQueue = filesQueue.reduce(
-      (sum, fl) => sum + Math.ceil(fl.items.length / BATCH_SIZE),
+      (sum, fl) => sum + Math.max(1, Math.ceil(getItemsForFilePass(fl).length / BATCH_SIZE)),
       0
     );
 
@@ -2535,33 +2605,38 @@ export default function App() {
     setTranslatingFileIds([]);
     setFileKeyUsageMap({});
 
-    const isRTL = RTL_LANGUAGES.includes(targetLanguage);
+    const isRTL = RTL_LANGUAGES.includes(effectiveTargetLang);
     let globalBatchCounter = 0;
     let nextQueueIndex = 0;
     const workerCount = Math.min(filesQueue.length, Math.max(1, concurrentFilesCount));
+    const completedInPassFileIds: string[] = [];
+    let totalLinesRepairedInPass = 0;
 
     // Atomic updater safe for multiple concurrent workers on different files
     const updateFileItemsInFolder = (
-      targetFolderId: string,
+      tFolderId: string,
       targetFileId: string,
       nextItems: SubtitleItem[],
       statusOverride?: SubtitleFolderFile['status']
     ) => {
-      const curFolder = foldersRef.current.find((f) => f.id === targetFolderId);
+      const curFolder = foldersRef.current.find((f) => f.id === tFolderId);
       if (!curFolder) return;
-      const allDone = nextItems.length > 0 && nextItems.every((it) => it.translatedText && it.translatedText.trim().length > 0);
+      const targetFl = curFolder.files.find((fl) => fl.id === targetFileId);
+      const isFileNowDone = targetFl
+        ? getFileCompletionStats({ ...targetFl, items: nextItems }, effectiveTargetLang).isDone
+        : false;
       const nextFolder: SubtitleFolder = {
         ...curFolder,
         updatedAt: Date.now(),
         files: curFolder.files.map((fl) =>
           fl.id === targetFileId
-            ? { ...fl, items: nextItems, status: statusOverride || (allDone ? 'done' : 'pending') }
+            ? { ...fl, items: nextItems, status: statusOverride || (isFileNowDone ? 'done' : 'pending') }
             : fl
         ),
       };
-      foldersRef.current = foldersRef.current.map((f) => (f.id === targetFolderId ? nextFolder : f));
+      foldersRef.current = foldersRef.current.map((f) => (f.id === tFolderId ? nextFolder : f));
       setFolders(foldersRef.current);
-      if (activeFolderIdRef.current === targetFolderId && activeFileIdRef.current === targetFileId) {
+      if (activeFolderIdRef.current === tFolderId && activeFileIdRef.current === targetFileId) {
         setItems(nextItems);
       }
       void saveFolderToDb(nextFolder);
@@ -2589,12 +2664,172 @@ export default function App() {
       }
     };
 
+    // Helper: sends a single batch of items to /api/translate with retries, RPM pacing & key failover
+    const translateSingleBatchForFile = async (
+      file: SubtitleFolderFile,
+      workerIdx: number,
+      batchItems: SubtitleItem[],
+      batchLabelKey: string,
+      batchNum: number,
+      extraInstruction?: string
+    ): Promise<Array<{ id: number; text: string }> | null> => {
+      let attempt = 0;
+      const MAX_RETRIES = 5;
+      const combinedCustomPrompt = extraInstruction
+        ? (customPrompt ? `${customPrompt}\n${extraInstruction}` : extraInstruction)
+        : customPrompt;
+
+      while (attempt < MAX_RETRIES && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+        attempt++;
+        if (attempt > 1) {
+          setRetryInfo({ batch: batchNum, attempt, maxRetries: MAX_RETRIES });
+          const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 20000);
+          const jitter = Math.floor(Math.random() * 1000);
+          await backgroundSleep(baseDelay + jitter);
+        }
+
+        if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+        const abortController = new AbortController();
+        const controllerKey = `${file.id}_${batchLabelKey}_a${attempt}`;
+        folderAbortControllersRef.current.set(controllerKey, abortController);
+
+        const orderedStoredKeys = activeAiProvider !== 'custom'
+          ? getOrderedHealthyKeys(file.assignedKeyId, workerIdx)
+          : [];
+        const orderedKeyStrings = orderedStoredKeys.map((k) => k.key.trim()).filter(Boolean);
+
+        if (activeAiProvider !== 'custom' && orderedStoredKeys[0]) {
+          setFileKeyUsageMap((prev) => ({ ...prev, [file.id]: orderedStoredKeys[0].label }));
+        }
+
+        try {
+          if (activeAiProvider !== 'custom' && orderedStoredKeys.length > 0) {
+            const primaryKey = orderedStoredKeys[0];
+            await acquireKeyRpmSlot(
+              primaryKey.key,
+              primaryKey.rpmLimit || DEFAULT_KEY_RPM_LIMIT,
+              abortController.signal,
+              (waitSec) => {
+                if (workerCount === 1) setPacingRemainingSec(waitSec);
+              }
+            );
+            if (workerCount === 1) setPacingRemainingSec(null);
+          }
+
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          const reqTimeoutMs = activeAiProvider === 'custom' ? 260_000 : 180_000;
+          const response = await fetchWithBackgroundTimeout(
+            '/api/translate',
+            {
+              method: 'POST',
+              headers: getApiHeaders(orderedKeyStrings),
+              body: JSON.stringify({
+                jobId: currentJobId,
+                items: batchItems.map((i) => ({
+                  id: i.id,
+                  text: i.originalText,
+                  key: i.gameKey,
+                  context: i.context,
+                })),
+                sourceLanguage: effectiveSourceLang === 'auto' ? undefined : effectiveSourceLang,
+                targetLanguage: effectiveTargetLang,
+                tone: selectedTone,
+                customPrompt: combinedCustomPrompt,
+                mode: 'cinema',
+                model: effectiveModel,
+                provider: activeAiProvider,
+                customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
+              }),
+            },
+            abortController.signal,
+            reqTimeoutMs
+          );
+
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          const data = await response.json().catch(() => ({}));
+
+          if (activeAiProvider !== 'custom' && orderedKeyStrings.length > 0) {
+            processGeminiKeyTelemetry(orderedKeyStrings, data);
+          }
+
+          if (!response.ok || (data.success === false && data.error)) {
+            const hasMoreHealthyKeys =
+              activeAiProvider !== 'custom' &&
+              getOrderedHealthyKeys(file.assignedKeyId, workerIdx).length > 0;
+            const isAuthRetryPossible =
+              (response.status === 401 || response.status === 403) && hasMoreHealthyKeys;
+            const isNonRetryable = !isAuthRetryPossible && (
+              data.retryable === false ||
+              response.status === 400 ||
+              response.status === 401 ||
+              response.status === 403 ||
+              response.status === 413
+            );
+            const errorMsg = data.error || `Server error (${response.status}) during translation.`;
+            if (isNonRetryable) {
+              showToast(`${file.fileName}: ${errorMsg}`, 'error');
+              cancelTranslationRef.current = true;
+              break;
+            }
+            throw new Error(errorMsg);
+          }
+
+          if (data.modelUsed) setActiveRunningModel(data.modelUsed);
+          if (data.isFallback !== undefined) setIsFallbackActive(Boolean(data.isFallback));
+
+          setRetryInfo(null);
+          return Array.isArray(data.translations) ? data.translations : [];
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) {
+            break;
+          }
+          if (attempt >= MAX_RETRIES) {
+            const errMsg = err instanceof Error ? err.message : `Batch ${batchNum} failed.`;
+            showToast(`${file.fileName}: ${errMsg}`, 'error');
+          }
+        } finally {
+          folderAbortControllersRef.current.delete(controllerKey);
+        }
+      }
+      return null;
+    };
+
+    const applyTranslationsToWorking = (
+      currentItems: SubtitleItem[],
+      translationsList: Array<{ id: number; text: string }>
+    ): { nextItems: SubtitleItem[]; appliedCount: number } => {
+      const updated = [...currentItems];
+      let appliedCount = 0;
+      translationsList.forEach((transObj) => {
+        const targetIndex = updated.findIndex((i) => i.id === transObj.id);
+        if (targetIndex !== -1 && typeof transObj.text === 'string' && transObj.text.trim().length > 0) {
+          let finalText = isRTL ? fixRTLPunctuation(transObj.text) : transObj.text;
+          if (isRTL && appendRTLMarkers) {
+            finalText = appendHiddenRTLMarker(finalText);
+          }
+          // Preserve exact original timestamps, cueIds, and styleTags 1:1
+          updated[targetIndex] = {
+            ...updated[targetIndex],
+            startTime: toEnglishDigits(updated[targetIndex].startTime),
+            endTime: toEnglishDigits(updated[targetIndex].endTime),
+            translatedText: finalText,
+          };
+          appliedCount++;
+        }
+      });
+      return { nextItems: updated, appliedCount };
+    };
+
     const runWorker = async (workerIdx: number) => {
       while (!cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
         const qIdx = nextQueueIndex++;
         if (qIdx >= filesQueue.length) break;
 
         const file = filesQueue[qIdx];
+        const initialStats = getFileCompletionStats(file, effectiveTargetLang);
         const initialKeys = activeAiProvider !== 'custom'
           ? getOrderedHealthyKeys(file.assignedKeyId, workerIdx)
           : [];
@@ -2605,7 +2840,8 @@ export default function App() {
         markWorkerActiveFile(file.id, true, initialKeyLabel);
 
         let workingItems = [...file.items];
-        const fileBatchCount = Math.ceil(workingItems.length / BATCH_SIZE);
+        const targetItemsForPass = getItemsForFilePass(file);
+        const fileBatchCount = Math.ceil(targetItemsForPass.length / BATCH_SIZE);
 
         for (let b = 0; b < fileBatchCount; b++) {
           if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
@@ -2622,7 +2858,7 @@ export default function App() {
           setCurrentBatch(batchNum);
 
           const startIndex = b * BATCH_SIZE;
-          const batchSlice = workingItems.slice(startIndex, startIndex + BATCH_SIZE);
+          const batchSlice = targetItemsForPass.slice(startIndex, startIndex + BATCH_SIZE);
 
           const itemsToTranslate: typeof batchSlice = [];
           const autoFilledItems: Array<{ id: number; text: string }> = [];
@@ -2644,7 +2880,7 @@ export default function App() {
               }
             });
             workingItems = updated;
-            updateFileItemsInFolder(folder.id, file.id, workingItems, 'translating');
+            updateFileItemsInFolder(folder!.id, file.id, workingItems, 'translating');
           }
 
           if (itemsToTranslate.length === 0) {
@@ -2652,148 +2888,26 @@ export default function App() {
             continue;
           }
 
-          let success = false;
-          let attempt = 0;
-          const MAX_RETRIES = 5;
+          const strictExtraNote = options?.missingOnly
+            ? `COMPLETION PASS: Translate every single line strictly into ${effectiveTargetLang}. Do NOT leave any English sentences untranslated.`
+            : undefined;
 
-          while (!success && attempt < MAX_RETRIES && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
-            attempt++;
-            if (attempt > 1) {
-              setRetryInfo({ batch: batchNum, attempt, maxRetries: MAX_RETRIES });
-              const baseDelay = Math.min(Math.pow(2, attempt - 1) * 2000, 20000);
-              const jitter = Math.floor(Math.random() * 1000);
-              await backgroundSleep(baseDelay + jitter);
-            }
+          const translationsList = await translateSingleBatchForFile(
+            file,
+            workerIdx,
+            itemsToTranslate,
+            `b${b}`,
+            batchNum,
+            strictExtraNote
+          );
 
-            if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
-
-            const abortController = new AbortController();
-            const controllerKey = `${file.id}_b${b}_a${attempt}`;
-            folderAbortControllersRef.current.set(controllerKey, abortController);
-
-            const orderedStoredKeys = activeAiProvider !== 'custom'
-              ? getOrderedHealthyKeys(file.assignedKeyId, workerIdx)
-              : [];
-            const orderedKeyStrings = orderedStoredKeys.map((k) => k.key.trim()).filter(Boolean);
-
-            if (activeAiProvider !== 'custom' && orderedStoredKeys[0]) {
-              setFileKeyUsageMap((prev) => ({ ...prev, [file.id]: orderedStoredKeys[0].label }));
-            }
-
-            try {
-              if (activeAiProvider !== 'custom' && orderedStoredKeys.length > 0) {
-                const primaryKey = orderedStoredKeys[0];
-                await acquireKeyRpmSlot(
-                  primaryKey.key,
-                  primaryKey.rpmLimit || DEFAULT_KEY_RPM_LIMIT,
-                  abortController.signal,
-                  (waitSec) => {
-                    if (workerCount === 1) setPacingRemainingSec(waitSec);
-                  }
-                );
-                if (workerCount === 1) setPacingRemainingSec(null);
-              }
-
-              if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
-
-              const reqTimeoutMs = activeAiProvider === 'custom' ? 260_000 : 180_000;
-              const response = await fetchWithBackgroundTimeout(
-                '/api/translate',
-                {
-                  method: 'POST',
-                  headers: getApiHeaders(orderedKeyStrings),
-                  body: JSON.stringify({
-                    jobId: currentJobId,
-                    items: itemsToTranslate.map((i) => ({
-                      id: i.id,
-                      text: i.originalText,
-                      key: i.gameKey,
-                      context: i.context,
-                    })),
-                    sourceLanguage: sourceLanguage === 'auto' ? undefined : sourceLanguage,
-                    targetLanguage,
-                    tone: selectedTone,
-                    customPrompt,
-                    mode: 'cinema',
-                    model: effectiveModel,
-                    provider: activeAiProvider,
-                    customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
-                  }),
-                },
-                abortController.signal,
-                reqTimeoutMs
-              );
-
-              if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
-
-              const data = await response.json().catch(() => ({}));
-
-              if (activeAiProvider !== 'custom' && orderedKeyStrings.length > 0) {
-                processGeminiKeyTelemetry(orderedKeyStrings, data);
-              }
-
-              if (!response.ok || (data.success === false && data.error)) {
-                const hasMoreHealthyKeys =
-                  activeAiProvider !== 'custom' &&
-                  getOrderedHealthyKeys(file.assignedKeyId, workerIdx).length > 0;
-                const isAuthRetryPossible =
-                  (response.status === 401 || response.status === 403) && hasMoreHealthyKeys;
-                const isNonRetryable = !isAuthRetryPossible && (
-                  data.retryable === false ||
-                  response.status === 400 ||
-                  response.status === 401 ||
-                  response.status === 403 ||
-                  response.status === 413
-                );
-                const errorMsg = data.error || `Server error (${response.status}) during translation.`;
-                if (isNonRetryable) {
-                  showToast(`${file.fileName}: ${errorMsg}`, 'error');
-                  cancelTranslationRef.current = true;
-                  break;
-                }
-                throw new Error(errorMsg);
-              }
-
-              if (data.modelUsed) setActiveRunningModel(data.modelUsed);
-              if (data.isFallback !== undefined) setIsFallbackActive(Boolean(data.isFallback));
-
-              const translationsList: Array<{ id: number; text: string }> = data.translations || [];
-              if (activeJobIdRef.current === currentJobId && !cancelTranslationRef.current) {
-                const updated = [...workingItems];
-                translationsList.forEach((transObj) => {
-                  const targetIndex = updated.findIndex((i) => i.id === transObj.id);
-                  if (targetIndex !== -1) {
-                    let finalText = isRTL ? fixRTLPunctuation(transObj.text) : transObj.text;
-                    if (isRTL && appendRTLMarkers) {
-                      finalText = appendHiddenRTLMarker(finalText);
-                    }
-                    // Preserve exact original timestamps & metadata 1:1
-                    updated[targetIndex] = {
-                      ...updated[targetIndex],
-                      translatedText: finalText,
-                    };
-                  }
-                });
-                workingItems = updated;
-                updateFileItemsInFolder(folder.id, file.id, workingItems, 'translating');
-                setTranslatedCount((prev) => prev + batchSlice.length);
-                success = true;
-                setRetryInfo(null);
-              }
-            } catch (err: any) {
-              if (err?.name === 'AbortError' || cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) {
-                break;
-              }
-              if (attempt >= MAX_RETRIES) {
-                const errMsg = err instanceof Error ? err.message : `Batch ${batchNum} failed.`;
-                showToast(`${file.fileName}: ${errMsg}`, 'error');
-              }
-            } finally {
-              folderAbortControllersRef.current.delete(controllerKey);
-            }
+          if (translationsList && activeJobIdRef.current === currentJobId && !cancelTranslationRef.current) {
+            const { nextItems } = applyTranslationsToWorking(workingItems, translationsList);
+            workingItems = nextItems;
+            updateFileItemsInFolder(folder!.id, file.id, workingItems, 'translating');
+            setTranslatedCount((prev) => prev + batchSlice.length);
           }
 
-          // Optional inter-batch pacing when manual pacing toggle is enabled (for custom or single-worker extra safety)
           const hasMoreInFile = b < fileBatchCount - 1;
           if (hasMoreInFile && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
             if (rateLimitPacing && activeAiProvider !== 'custom') {
@@ -2804,8 +2918,51 @@ export default function App() {
           }
         }
 
-        const isFileDone = workingItems.length > 0 && workingItems.every((it) => it.translatedText && it.translatedText.trim().length > 0);
-        updateFileItemsInFolder(folder.id, file.id, workingItems, isFileDone ? 'done' : 'pending');
+        // Automatic Final Targeted Micro-Repair Pass:
+        // If any lines were dropped, returned empty, or left untranslated in English,
+        // automatically run up to 2 small focused repair batches so the file reliably reaches 100% green checkmark!
+        if (!cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+          const postMainStats = getFileCompletionStats({ ...file, items: workingItems }, effectiveTargetLang);
+          if (postMainStats.missingItemIds.length > 0) {
+            const REPAIR_CHUNK = 15;
+            const repairIds = postMainStats.missingItemIds;
+            const repairItemsAll = workingItems.filter((it) => repairIds.includes(it.id));
+            const maxRepairBatches = Math.min(2, Math.ceil(repairItemsAll.length / REPAIR_CHUNK));
+
+            for (let rb = 0; rb < maxRepairBatches; rb++) {
+              if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+              const repairSlice = repairItemsAll.slice(rb * REPAIR_CHUNK, (rb + 1) * REPAIR_CHUNK);
+              if (repairSlice.length === 0) break;
+
+              const repairTranslations = await translateSingleBatchForFile(
+                file,
+                workerIdx,
+                repairSlice,
+                `repair${rb}`,
+                globalBatchCounter,
+                `FINAL REPAIR PASS: The following ${repairSlice.length} subtitle line(s) were missed or remained in English. Translate EVERY SINGLE LINE strictly into ${effectiveTargetLang} with exact 1:1 ID matching.`
+              );
+
+              if (repairTranslations && activeJobIdRef.current === currentJobId && !cancelTranslationRef.current) {
+                const { nextItems } = applyTranslationsToWorking(workingItems, repairTranslations);
+                workingItems = nextItems;
+                updateFileItemsInFolder(folder!.id, file.id, workingItems, 'translating');
+              }
+            }
+          }
+        }
+
+        const finalStats = getFileCompletionStats({ ...file, items: workingItems }, effectiveTargetLang);
+        updateFileItemsInFolder(folder!.id, file.id, workingItems, finalStats.isDone ? 'done' : 'pending');
+
+        const linesFixed = Math.max(0, initialStats.missingCount - finalStats.missingCount);
+        totalLinesRepairedInPass += linesFixed;
+        if (options?.missingOnly && (finalStats.isDone || linesFixed > 0)) {
+          if (!completedInPassFileIds.includes(file.id)) {
+            completedInPassFileIds.push(file.id);
+          }
+        }
+
         markWorkerActiveFile(file.id, false);
       }
     };
@@ -2817,6 +2974,26 @@ export default function App() {
     } finally {
       releaseKeepAlive();
       folderAbortControllersRef.current.clear();
+
+      // Persist the exact list of files completed during a "Complete Missing Lines" pass
+      // so the user gets a dedicated 1-click separate download for ONLY those files!
+      if (options?.missingOnly && completedInPassFileIds.length > 0 && folder) {
+        const latestFolder = foldersRef.current.find((f) => f.id === folder!.id);
+        if (latestFolder) {
+          const updatedWithCompletedBatch: SubtitleFolder = {
+            ...latestFolder,
+            updatedAt: Date.now(),
+            lastCompletedFileIds: completedInPassFileIds,
+            lastCompletedAt: Date.now(),
+          };
+          foldersRef.current = foldersRef.current.map((f) =>
+            f.id === latestFolder.id ? updatedWithCompletedBatch : f
+          );
+          setFolders(foldersRef.current);
+          void saveFolderToDb(updatedWithCompletedBatch);
+        }
+      }
+
       if (activeJobIdRef.current === currentJobId) {
         translatingFileIdsRef.current = [];
         setTranslatingFileIds([]);
@@ -2827,12 +3004,21 @@ export default function App() {
         setIsTranslating(false);
         isTranslatingRef.current = false;
         if (!cancelTranslationRef.current) {
-          showToast(
-            uiLang === 'en'
-              ? `Translation complete! (${filesQueue.length} file(s))`
-              : `ترجمه ${filesQueue.length} فایل با موفقیت به پایان رسید!`,
-            'success'
-          );
+          if (options?.missingOnly) {
+            showToast(
+              uiLang === 'en'
+                ? `Completed ${completedInPassFileIds.length} file(s) (${totalLinesRepairedInPass} missing lines translated). Separate download is ready!`
+                : `${completedInPassFileIds.length} فایل ناقص تکمیل شد (${totalLinesRepairedInPass} خط باقی‌مانده ترجمه شد). دکمه دانلود جداگانه آماده است!`,
+              'success'
+            );
+          } else {
+            showToast(
+              uiLang === 'en'
+                ? `Translation complete! (${filesQueue.length} file(s))`
+                : `ترجمه ${filesQueue.length} فایل با موفقیت به پایان رسید!`,
+              'success'
+            );
+          }
         }
       }
     }
@@ -2853,6 +3039,132 @@ export default function App() {
     });
   };
 
+  // Complete ONLY missing / leftover-English lines across all incomplete files in a folder
+  const handleCompleteMissingFolder = (folderId: string) => {
+    if (isTranslatingRef.current) return;
+    const targetFolder = foldersRef.current.find((f) => f.id === folderId);
+    if (!targetFolder || targetFolder.files.length === 0) {
+      showToast(t.noSubtitlesToTranslate, 'warning');
+      return;
+    }
+    const effectiveTargetLang = targetLanguage || 'fa';
+    const folderStats = getFolderCompletionStats(targetFolder, effectiveTargetLang);
+    if (folderStats.incompleteFileCount === 0) {
+      showToast(
+        uiLang === 'en'
+          ? 'All subtitles in this folder are already 100% complete!'
+          : 'همه زیرنویس‌های این پوشه ۱۰۰٪ تکمیل هستند!',
+        'success'
+      );
+      return;
+    }
+
+    setSelectedFileIds([]);
+    if (sourceLanguage === 'auto') {
+      setSourceLanguage('en');
+    }
+    if (!targetLanguage) {
+      setTargetLanguage('fa');
+    }
+
+    const incompleteIds = folderStats.incompleteFiles.map((fl) => fl.id);
+    showToast(
+      uiLang === 'en'
+        ? `Completing ${folderStats.missingLines} remaining line(s) across ${folderStats.incompleteFileCount} file(s)...`
+        : `شروع تکمیل ${folderStats.missingLines} خط باقی‌مانده در ${folderStats.incompleteFileCount} فایل ناقص...`,
+      'info'
+    );
+
+    void handleTranslateFilesConcurrently(incompleteIds, {
+      targetFolderId: folderId,
+      missingOnly: true,
+    });
+  };
+
+  // Dedicated Separate Download for ONLY the files completed by "Complete Missing Lines"
+  const handleBatchExportCompletedFiles = (folderId: string, format: 'srt' | 'vtt') => {
+    const folder = foldersRef.current.find((f) => f.id === folderId);
+    const completedIds = folder?.lastCompletedFileIds || [];
+    if (!folder || completedIds.length === 0) {
+      showToast(
+        uiLang === 'en'
+          ? 'No recently completed files found for separate download.'
+          : 'فایل تکمیل‌شده‌ای برای دانلود جداگانه ثبت نشده است.',
+        'warning'
+      );
+      return;
+    }
+
+    const completedFiles = folder.files.filter((fl) => completedIds.includes(fl.id));
+    if (completedFiles.length === 0) {
+      showToast(
+        uiLang === 'en'
+          ? 'No recently completed files found in this folder.'
+          : 'فایل‌های تکمیل‌شده در این پوشه یافت نشدند.',
+        'warning'
+      );
+      return;
+    }
+
+    const isRTL = RTL_LANGUAGES.includes(targetLanguage);
+    const entries = completedFiles.map((file) => {
+      const baseName = file.fileName.replace(/\.[^/.]+$/, '') || file.fileName;
+      const content = bilingualConfig?.enabled
+        ? exportBilingualSubtitleFile(file.items, format, bilingualConfig, file.rawHeader, isRTL)
+        : exportSubtitleFile(
+            file.items,
+            format,
+            file.rawHeader,
+            isRTL,
+            appendRTLMarkers,
+            file.subFps || 25
+          );
+      return {
+        name: `${baseName}.${format}`,
+        content,
+      };
+    });
+
+    if (entries.length === 1) {
+      const blob = new Blob([entries[0].content], { type: 'text/plain;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = entries[0].name;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } else {
+      const zipBlob = createZipBlob(entries);
+      const safeFolderName = folder.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim() || 'Subtitles';
+      const url = URL.createObjectURL(zipBlob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${safeFolderName}_Completed_${entries.length}_${format.toUpperCase()}.zip`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    showToast(
+      uiLang === 'en'
+        ? `Downloaded ${entries.length} completed ${format.toUpperCase()} file(s) separately!`
+        : `${entries.length} فایل تکمیل‌شده به‌صورت جداگانه با فرمت ${format.toUpperCase()} دانلود شد!`,
+      'success'
+    );
+  };
+
+  const handleClearCompletedFilesBatch = (folderId: string) => {
+    const folder = foldersRef.current.find((f) => f.id === folderId);
+    if (!folder) return;
+    const updated: SubtitleFolder = {
+      ...folder,
+      lastCompletedFileIds: undefined,
+      lastCompletedAt: undefined,
+    };
+    foldersRef.current = foldersRef.current.map((f) => (f.id === folderId ? updated : f));
+    setFolders(foldersRef.current);
+    void saveFolderToDb(updated);
+  };
+
   // Fast Batch Export Entire Folder in SRT or VTT (.ZIP)
   const handleBatchExportFolder = (format: 'srt' | 'vtt') => {
     const folder = foldersRef.current.find((f) => f.id === activeFolderIdRef.current);
@@ -2865,8 +3177,8 @@ export default function App() {
     let untranslatedFilesCount = 0;
 
     const entries = folder.files.map((file) => {
-      const hasUntranslated = file.items.some((it) => !it.translatedText || !it.translatedText.trim());
-      if (hasUntranslated) untranslatedFilesCount++;
+      const fStats = getFileCompletionStats(file, targetLanguage);
+      if (!fStats.isDone) untranslatedFilesCount++;
 
       const baseName = file.fileName.replace(/\.[^/.]+$/, '') || file.fileName;
       const content = bilingualConfig?.enabled
@@ -2969,6 +3281,10 @@ export default function App() {
             onAssignFileKey={handleAssignFileKey}
             onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
             onRetranslateFolder={handleRetranslateFolder}
+            onCompleteMissingFolder={handleCompleteMissingFolder}
+            onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
+            onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
+            targetLanguage={targetLanguage}
             onExportFullBackup={handleExportFullBackup}
             onImportFullBackup={handleImportFullBackup}
             selectedEncoding={selectedEncoding}
@@ -3010,6 +3326,10 @@ export default function App() {
                 onAssignFileKey={handleAssignFileKey}
                 onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
                 onRetranslateFolder={handleRetranslateFolder}
+                onCompleteMissingFolder={handleCompleteMissingFolder}
+                onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
+                onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
+                targetLanguage={targetLanguage}
                 onExportFullBackup={handleExportFullBackup}
                 onImportFullBackup={handleImportFullBackup}
                 selectedEncoding={selectedEncoding}
@@ -3151,6 +3471,7 @@ export default function App() {
                 onFillEmptyWithOriginal={handleFillEmptyWithOriginal}
                 onRepairCorruptedSubtitles={handleRepairCorruptedSubtitles}
                 uiLang={uiLang}
+                targetLanguage={targetLanguage}
                 onOpenBilingualModal={() => setIsBilingualModalOpen(true)}
                 bilingualConfig={bilingualConfig}
               />
