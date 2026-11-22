@@ -2045,8 +2045,6 @@ app.post('/api/realign-subtitles', aiRateLimiter, async (req, res) => {
     }
 
     const effectiveTargetLang = String(targetLanguage || 'fa').trim();
-    const toneDescription = (tone && (TONE_PROMPTS as any)[tone]) || TONE_PROMPTS.cinematic;
-    const userCustomPrompt = customPrompt?.trim() || '';
 
     const compactItems = items.map((it: any) => ({
       id: Number(it.id),
@@ -2054,39 +2052,42 @@ app.post('/api/realign-subtitles', aiRateLimiter, async (req, res) => {
       fa: String(it.fa ?? it.translatedText ?? ''),
     }));
     const allowedIdSet = new Set<number>(compactItems.map((it) => it.id));
+    const origItemById = new Map<number, { id: number; en: string; fa: string }>();
+    compactItems.forEach((ci) => origItemById.set(ci.id, ci));
 
-    const systemInstruction = `You are a Subtitle Timing & Text-Alignment Surgeon for movies/TV (${effectiveTargetLang}).
-Each input item has:
-- "id": immutable video cue index locked to an exact timestamp
-- "en": exact English spoken line at that timestamp
-- "fa": current translation stored at that timestamp
+    // Compact tuple wire format: [id, en, fa] saves ~25-30% input tokens vs repeated object keys
+    const compactTuples = compactItems.map((ci) => [ci.id, ci.en, ci.fa]);
 
-YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
-1. Inspect EVERY item in order to check if "fa" accurately matches ONLY its own "en" at that exact "id".
-2. DETECT & FIX THESE 3 PROBLEMS:
-   a) CUE SHIFT / MERGE DRIFT: If an earlier pass merged two English cues into one "fa" and shifted later translations 1-2 cues early or late (so cue N's "fa" actually translates cue N+1 or N-1), slide/re-align the existing translations back onto their EXACT true "id"s and split/translate any merged portion so EVERY "id" matches ONLY its own "en" 1:1.
-   b) MISSING / UNTRANSLATED LINES: If "en" has spoken words but "fa" is empty or still untranslated in English, translate it cleanly into ${effectiveTargetLang}.
-   c) BROKEN FORMATTING: Never output timestamps, cue numbers, "-->", or blank lines (\\n\\n) inside "text". Preserve tags (<i>, <b>) and variables ({0}, %s).
-3. DIFF-ONLY SPEED RULE:
-   - If an item's "fa" ALREADY accurately translates its own "en" at that exact "id", DO NOT include that "id" in "fixes"! Keep good translations untouched.
-   - If ALL items in this window are already properly aligned 1:1 and translated, return: {"allAligned": true, "fixes": []}.
-4. TONE & FIDELITY:
-   - Tone: ${toneDescription}
-   ${userCustomPrompt ? `- Custom Instruction: "${userCustomPrompt}"` : ''}
-   - When tone is 'expose', 'humorous', 'conversational', or 'epic', preserve uncensored natural fidelity with zero softening.
-5. STRICT JSON OUTPUT:
-   Return ONLY valid JSON:
-   {
-     "allAligned": true | false,
-     "fixes": [
-       { "id": 12, "text": "..." }
-     ]
-   }`;
+    const normalizeForNoOpCheck = (s: string): string =>
+      s
+        .replace(/[\u200E\u200F\u202A-\u202E\uFEFF]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
 
-    const promptText = `Audit alignment & fix ONLY shifted, merged, or untranslated lines in these ${compactItems.length} cues:\n` +
-      JSON.stringify(compactItems);
+    const systemInstruction = `You are a STRICT, ULTRA-CONSERVATIVE Subtitle Cue-Alignment Auditor (${effectiveTargetLang}).
+Input is a JSON array of [id, en, fa] tuples where each "id" is locked to a fixed video timestamp.
 
-    const validateAndExtractFixes = (parsed: any): { allAligned: boolean; fixes: Array<{ id: number; text: string }> } => {
+CRITICAL ANTI-REWRITE RULE (DO NOT WASTE TOKENS):
+- DO NOT polish, rephrase, improve style/tone, swap synonyms, or tweak punctuation of ANY cue whose "fa" ALREADY translates its own "en"!
+- Even if a translation is rough, literal, or informal, if it matches the meaning of its own "en" cue, LEAVE IT COMPLETELY ALONE.
+- If all cues already match their own "en" (even roughly), return {"allAligned":true,"moves":[],"fixes":[]} immediately!
+
+ONLY report changes for these 2 real defects:
+1. CUE SHIFT ("moves"): If cue A's existing "fa" actually translates cue B's "en" (shifted 1+ cues early/late), output {"id": B, "fromId": A} in "moves" to slide the existing translation verbatim onto its true cue without rewriting it!
+2. MERGED / MISSING / UNTRANSLATED ("fixes"): ONLY if a cue's "fa" is empty, still untranslated English (when "en" has spoken words), or combines two cues that must be split so each cue matches ONLY its own "en", output {"id": X, "text": "..."} in "fixes". Never include timestamps, "-->", or blank lines (\\n\\n).
+
+Return ONLY valid JSON:
+{"allAligned":boolean,"moves":[{"id":number,"fromId":number}],"fixes":[{"id":number,"text":string}]}`;
+
+    const promptText = `Check cue alignment ONLY (zero stylistic edits) for these ${compactTuples.length} [id,en,fa] cues:\n` +
+      JSON.stringify(compactTuples);
+
+    const validateAndExtractFixes = (parsed: any): {
+      allAligned: boolean;
+      fixes: Array<{ id: number; text: string }>;
+      movesCount: number;
+      editsCount: number;
+    } => {
       if (!parsed || typeof parsed !== 'object') {
         const err: any = new Error('Malformed alignment JSON response.');
         err.errorType = 'malformed_json';
@@ -2095,10 +2096,40 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
         throw err;
       }
 
+      const rawMoves = Array.isArray(parsed.moves) ? parsed.moves : [];
       const rawFixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
-      const seenIds = new Set<number>();
-      const validFixes: Array<{ id: number; text: string }> = [];
+      const resolvedById = new Map<number, string>();
+      let movesCount = 0;
+      let editsCount = 0;
 
+      // Step 1: Apply zero-token verbatim pointer moves against immutable snapshot
+      for (const m of rawMoves) {
+        if (!m || (typeof m.id !== 'number' && typeof m.id !== 'string')) continue;
+        const targetId = Number(m.id);
+        const fromId = Number(m.fromId);
+        if (!Number.isInteger(targetId) || !allowedIdSet.has(targetId)) {
+          const idErr: any = new Error(`Alignment move returned unexpected target id ${targetId}.`);
+          idErr.errorType = 'id_alignment_mismatch';
+          idErr.status = 502;
+          idErr.retryable = true;
+          throw idErr;
+        }
+        if (!Number.isInteger(fromId) || !allowedIdSet.has(fromId)) {
+          continue; // Ignore invalid source pointer safely
+        }
+        if (targetId === fromId) continue;
+        const sourceItem = origItemById.get(fromId);
+        const targetOrig = origItemById.get(targetId);
+        if (!sourceItem || !targetOrig) continue;
+        const movedText = stripAccidentalTimestamps(sourceItem.fa);
+        if (!movedText.trim()) continue;
+        if (normalizeForNoOpCheck(movedText) === normalizeForNoOpCheck(targetOrig.fa)) continue;
+        resolvedById.set(targetId, movedText);
+        movesCount++;
+      }
+
+      // Step 2: Apply explicit text fixes (only for split/merged/missing cues)
+      const seenFixIds = new Set<number>();
       for (const f of rawFixes) {
         if (!f || (typeof f.id !== 'number' && typeof f.id !== 'string')) continue;
         const numId = Number(f.id);
@@ -2109,27 +2140,38 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
           idErr.retryable = true;
           throw idErr;
         }
-        if (seenIds.has(numId)) {
+        if (seenFixIds.has(numId)) {
           const dupErr: any = new Error(`Alignment response returned duplicate cue id ${numId}.`);
           dupErr.errorType = 'id_alignment_mismatch';
           dupErr.status = 502;
           dupErr.retryable = true;
           throw dupErr;
         }
-        seenIds.add(numId);
+        seenFixIds.add(numId);
 
         const cleaned = stripAccidentalTimestamps(String(f.text ?? ''));
-        const origItem = compactItems.find((ci) => ci.id === numId);
+        const origItem = origItemById.get(numId);
         // Never overwrite a non-empty cue with an empty fix
         if (origItem && origItem.en.trim().length > 0 && cleaned.trim().length === 0) {
           continue;
         }
-        validFixes.push({ id: numId, text: cleaned });
+        // Skip no-op fixes where normalized text didn't actually change
+        if (origItem && normalizeForNoOpCheck(cleaned) === normalizeForNoOpCheck(origItem.fa)) {
+          continue;
+        }
+        resolvedById.set(numId, cleaned);
+        editsCount++;
       }
 
+      const validFixes: Array<{ id: number; text: string }> = Array.from(resolvedById.entries()).map(
+        ([id, text]) => ({ id, text })
+      );
+
       return {
-        allAligned: Boolean(parsed.allAligned) && validFixes.length === 0,
+        allAligned: validFixes.length === 0,
         fixes: validFixes,
+        movesCount,
+        editsCount,
       };
     };
 
@@ -2175,7 +2217,7 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
               { role: 'system', content: systemInstruction },
               { role: 'user', content: promptText },
             ],
-            temperature: 0.15,
+            temperature: 0.0,
           }),
           signal: combinedSignal,
           redirect: 'error',
@@ -2205,6 +2247,8 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
           success: true,
           allAligned: extracted.allAligned,
           fixes: extracted.fixes,
+          movesCount: extracted.movesCount,
+          editsCount: extracted.editsCount,
           modelUsed: customProvider.model.trim(),
           isFallback: false,
           requestId,
@@ -2237,7 +2281,7 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
             config: {
               systemInstruction,
               responseMimeType: 'application/json',
-              temperature: 0.15,
+              temperature: 0.0,
               safetySettings: [
                 { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
                 { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -2249,6 +2293,17 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
                 type: Type.OBJECT,
                 properties: {
                   allAligned: { type: Type.BOOLEAN },
+                  moves: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        id: { type: Type.INTEGER },
+                        fromId: { type: Type.INTEGER },
+                      },
+                      required: ['id', 'fromId'],
+                    },
+                  },
                   fixes: {
                     type: Type.ARRAY,
                     items: {
@@ -2261,7 +2316,7 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
                     },
                   },
                 },
-                required: ['allAligned', 'fixes'],
+                required: ['allAligned', 'moves', 'fixes'],
               },
             },
           },
@@ -2290,6 +2345,8 @@ YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
         success: true,
         allAligned: extracted.allAligned,
         fixes: extracted.fixes,
+        movesCount: extracted.movesCount,
+        editsCount: extracted.editsCount,
         modelUsed,
         isFallback,
         keyIndexUsed,

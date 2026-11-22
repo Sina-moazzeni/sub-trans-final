@@ -3518,31 +3518,28 @@ export default function App() {
     }
 
     // =========================================================================
-    // STAGE 2: HIGH-SPEED DIFF-ONLY TEXT ALIGNMENT AUDIT (/api/realign-subtitles)
+    // STAGE 2: ULTRA-ECONOMY DIFF-ONLY TEXT ALIGNMENT AUDIT (/api/realign-subtitles)
     // =========================================================================
-    const WINDOW_SIZE = 35;
-    const WINDOW_STRIDE = 32; // 3-line overlap catches shifts crossing window boundaries!
+    // 75-line windows cut API requests & system-prompt input tokens by >55%.
+    // Adaptive overlap: 0 overlap on clean windows; only overlap 4 lines when a fix hits the boundary!
+    const WINDOW_SIZE = 75;
+    const BOUNDARY_OVERLAP = 4;
 
-    const buildWindowRanges = (totalItems: number): Array<{ start: number; end: number }> => {
-      if (totalItems <= 0) return [];
-      if (totalItems <= WINDOW_SIZE) return [{ start: 0, end: totalItems }];
-      const ranges: Array<{ start: number; end: number }> = [];
-      let start = 0;
-      while (start < totalItems) {
-        const end = Math.min(totalItems, start + WINDOW_SIZE);
-        ranges.push({ start, end });
-        if (end >= totalItems) break;
-        start += WINDOW_STRIDE;
-      }
-      return ranges;
-    };
+    const estimateWindowCount = (totalItems: number): number =>
+      totalItems <= 0 ? 0 : Math.max(1, Math.ceil(totalItems / WINDOW_SIZE));
 
     const effectiveModel = resolveModelId(selectedModel);
     const totalLinesAcrossQueue = queue.reduce((acc, e) => acc + e.file.items.length, 0);
     const totalWindowsAcrossQueue = queue.reduce(
-      (acc, e) => acc + buildWindowRanges(e.file.items.length).length,
+      (acc, e) => acc + estimateWindowCount(e.file.items.length),
       0
     );
+
+    const normalizeForDiffCheck = (s: string): string =>
+      s
+        .replace(/[\u200E\u200F\u202A-\u202E\uFEFF]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
 
     const currentJobId = `audit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     activeJobIdRef.current = currentJobId;
@@ -3566,8 +3563,8 @@ export default function App() {
 
     showToast(
       uiLang === 'en'
-        ? `Timing locked (${stage1FixedTimestamps} timestamps). Starting fast text-alignment check on ${queue.length} file(s)...`
-        : `تایم‌بندی قفل شد (${stage1FixedTimestamps} تایم‌کد${stage1RemovedOrphans > 0 ? `، ${stage1RemovedOrphans} هدر اصلاح‌شده` : ''}). شروع بررسی هوشمند متن روی ${queue.length} فایل (بدون ترجمه مجدد)...`,
+        ? `Timing locked (${stage1FixedTimestamps} timestamps). Starting ultra-economy alignment check on ${queue.length} file(s)...`
+        : `تایم‌بندی قفل شد (${stage1FixedTimestamps} تایم‌کد${stage1RemovedOrphans > 0 ? `، ${stage1RemovedOrphans} هدر اصلاح‌شده` : ''}). شروع بررسی فوق‌کم‌مصرف متن روی ${queue.length} فایل (بدون بازنویسی خطوط سالم)...`,
       'info'
     );
 
@@ -3689,8 +3686,6 @@ export default function App() {
                   fa: it.translatedText || '',
                 })),
                 targetLanguage: effectiveTargetLang,
-                tone: selectedTone,
-                customPrompt,
                 model: effectiveModel,
                 provider: activeAiProvider,
                 customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
@@ -3765,12 +3760,14 @@ export default function App() {
         markWorkerActiveFile(file.id, true, initialKeyLabel);
 
         let workingItems = [...file.items];
-        const windows = buildWindowRanges(workingItems.length);
+        const totalFileItems = workingItems.length;
         let fileFixedCount = 0;
         let fileHadError = false;
+        let start = 0;
         let prevEnd = 0;
+        let winIdx = 0;
 
-        for (let w = 0; w < windows.length; w++) {
+        while (start < totalFileItems) {
           if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
 
           while (isPausedRef.current) {
@@ -3784,18 +3781,20 @@ export default function App() {
           const winNum = globalWindowCounter;
           setCurrentBatch(winNum);
 
-          const { start, end } = windows[w];
+          const end = Math.min(totalFileItems, start + WINDOW_SIZE);
           const windowSlice = workingItems.slice(start, end);
           const newlyCoveredLines = Math.max(0, end - prevEnd);
           prevEnd = Math.max(prevEnd, end);
 
-          const fixes = await auditSingleWindowForFile(file, workerIdx, windowSlice, w, winNum);
+          const fixes = await auditSingleWindowForFile(file, workerIdx, windowSlice, winIdx, winNum);
+          winIdx++;
 
           if (fixes === null) {
             fileHadError = true;
             break;
           }
 
+          let boundaryFixHit = false;
           if (fixes.length > 0 && activeJobIdRef.current === currentJobId && !cancelTranslationRef.current) {
             const nextItems = [...workingItems];
             let windowApplied = 0;
@@ -3806,6 +3805,12 @@ export default function App() {
                 if (isRTL && appendRTLMarkers) {
                   finalText = appendHiddenRTLMarker(finalText);
                 }
+                if (
+                  normalizeForDiffCheck(finalText) ===
+                  normalizeForDiffCheck(nextItems[targetIdx].translatedText || '')
+                ) {
+                  continue;
+                }
                 nextItems[targetIdx] = {
                   ...nextItems[targetIdx],
                   startTime: toEnglishDigits(nextItems[targetIdx].startTime),
@@ -3813,6 +3818,9 @@ export default function App() {
                   translatedText: finalText,
                 };
                 windowApplied++;
+                if (targetIdx >= end - BOUNDARY_OVERLAP) {
+                  boundaryFixHit = true;
+                }
               }
             }
             if (windowApplied > 0) {
@@ -3827,8 +3835,12 @@ export default function App() {
 
           setTranslatedCount((prev) => prev + newlyCoveredLines);
 
-          if (w < windows.length - 1 && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
-            await backgroundSleep(activeAiProvider === 'custom' ? 350 : 400);
+          if (end >= totalFileItems) break;
+          // Adaptive stride: zero overlap on clean windows, 4-line overlap ONLY if a shift touched the boundary!
+          start = boundaryFixHit ? Math.max(start + 1, end - BOUNDARY_OVERLAP) : end;
+
+          if (!cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+            await backgroundSleep(activeAiProvider === 'custom' ? 300 : 350);
           }
         }
 
