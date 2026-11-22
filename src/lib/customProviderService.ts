@@ -321,6 +321,15 @@ export function classifyCustomProviderError(
     };
   }
 
+  if (err?.errorType === 'id_alignment_mismatch') {
+    return {
+      errorType: 'id_alignment_mismatch',
+      message: err.message || 'عدم تطابق شناسه خطوط در پاسخ مدل (جلوگیری از جابه‌جایی تایم‌بندی). تلاش مجدد...',
+      retryable: true,
+      status: 502,
+    };
+  }
+
   if (httpStatus === 400) {
     return {
       errorType: 'invalid_config',
@@ -381,8 +390,180 @@ export function classifyCustomProviderError(
 }
 
 /**
+ * Strips any accidental SRT/VTT cue timestamps or cue numbers echoed by an LLM inside translated text.
+ */
+export function stripAccidentalTimestamps(text: string): string {
+  if (!text || typeof text !== 'string') return '';
+  const TIMING_RE =
+    /^\s*(?:\d{1,4}:)?\d{1,2}:\d{1,2}(?:[.,]\d{1,6})?\s*-->\s*(?:\d{1,4}:)?\d{1,2}:\d{1,2}(?:[.,]\d{1,6})?(?:\s+.*)?$/;
+  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+  const out: string[] = [];
+  for (const line of lines) {
+    if (TIMING_RE.test(line)) {
+      if (out.length > 0 && /^\d+$/.test(out[out.length - 1].trim())) {
+        out.pop();
+      }
+      continue;
+    }
+    out.push(line.replace(/-->/g, '→'));
+  }
+  return out.join('\n').trim();
+}
+
+export interface BatchAlignmentAudit {
+  translationMap: Map<number, string>;
+  unexpectedIds: number[];
+  duplicateIds: number[];
+  outOfOrderIds: number[];
+  missingIds: number[];
+  emptyIds: number[];
+  tailDropShift: boolean;
+  consecutiveDuplicateShift: boolean;
+  hasShiftRisk: boolean;
+  shiftReasons: string[];
+}
+
+function normalizeForDupCheck(text: string): string {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\{\\[^}]+\}/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
+}
+
+/**
+ * Strict Anti-Shift Alignment Auditor (Shared by Gemini & Custom Provider):
+ * Detects EVERY signature of LLM cue-merge / off-by-one shift before translations can ever
+ * be saved onto subtitle timestamps:
+ *  1) unexpectedIds: model invented/renumbered IDs outside the batch
+ *  2) duplicateIds: model emitted the same ID more than once
+ *  3) outOfOrderIds: model returned IDs out of monotonic input order
+ *  4) tailDropShift: model returned fewer items than input AND omitted the trailing ID(s)
+ *     at the end of a multi-cue batch — the classic signature of merging 2 earlier cues
+ *     and shifting all subsequent cues earlier by 3-6 seconds!
+ *  5) consecutiveDuplicateShift: 2+ adjacent pairs with distinct English sources received
+ *     identical non-empty translations (happens when an LLM pads a shifted array)
+ */
+export function auditBatchAlignment(
+  originalItems: Array<{ id: number; text: string }>,
+  rawTranslations: any[]
+): BatchAlignmentAudit {
+  const expectedIds = originalItems.map((i) => Number(i.id));
+  const expectedIdSet = new Set<number>(expectedIds);
+  const expectedPosById = new Map<number, number>();
+  expectedIds.forEach((id, idx) => expectedPosById.set(id, idx));
+
+  const translationMap = new Map<number, string>();
+  const unexpectedIds: number[] = [];
+  const duplicateIds: number[] = [];
+  const outOfOrderIds: number[] = [];
+
+  let lastSeenPos = -1;
+  (Array.isArray(rawTranslations) ? rawTranslations : []).forEach((t: any) => {
+    if (!t || (typeof t.id !== 'number' && typeof t.id !== 'string')) return;
+    const numId = Number(t.id);
+    if (!Number.isInteger(numId)) return;
+
+    if (!expectedIdSet.has(numId)) {
+      unexpectedIds.push(numId);
+      return;
+    }
+
+    const pos = expectedPosById.get(numId)!;
+    if (translationMap.has(numId)) {
+      duplicateIds.push(numId);
+    } else if (pos < lastSeenPos) {
+      outOfOrderIds.push(numId);
+    }
+    lastSeenPos = Math.max(lastSeenPos, pos);
+
+    const cleanedText = stripAccidentalTimestamps(String(t.text ?? ''));
+    translationMap.set(numId, cleanedText);
+  });
+
+  const missingIds: number[] = [];
+  const emptyIds: number[] = [];
+  originalItems.forEach((item) => {
+    const hasEntry = translationMap.has(item.id);
+    if (!hasEntry) {
+      missingIds.push(item.id);
+      return;
+    }
+    const val = translationMap.get(item.id)!;
+    if (item.text && item.text.trim().length > 0 && val.trim().length === 0) {
+      emptyIds.push(item.id);
+    }
+  });
+
+  // Tail-drop shift signature:
+  // In a batch of >= 5 cues, if the model omitted IDs AND those missing IDs form a contiguous
+  // suffix at the very end of the batch (e.g., sent [36..70], got [36..69], missing [70] or [69,70]),
+  // that is almost ALWAYS a cue-merge earlier in the batch that shifted every cue after it!
+  let tailDropShift = false;
+  if (originalItems.length >= 5 && missingIds.length > 0 && missingIds.length <= Math.ceil(originalItems.length * 0.4)) {
+    const missingSet = new Set(missingIds);
+    const lastExpectedId = expectedIds[expectedIds.length - 1];
+    if (missingSet.has(lastExpectedId)) {
+      // Check if ALL missing IDs sit in the trailing suffix
+      let suffixMissingCount = 0;
+      for (let i = expectedIds.length - 1; i >= 0; i--) {
+        if (missingSet.has(expectedIds[i])) {
+          suffixMissingCount++;
+        } else {
+          break;
+        }
+      }
+      if (suffixMissingCount === missingIds.length) {
+        tailDropShift = true;
+      }
+    }
+  }
+
+  // Consecutive duplicate translation shift signature:
+  // If >= 2 adjacent cue pairs have distinct substantial source text (>= 8 chars)
+  // yet received the EXACT same non-empty translated text, the model padded or duplicated cues.
+  let suspiciousDupPairs = 0;
+  for (let i = 0; i + 1 < originalItems.length; i++) {
+    const a = originalItems[i];
+    const b = originalItems[i + 1];
+    const srcA = normalizeForDupCheck(a.text);
+    const srcB = normalizeForDupCheck(b.text);
+    if (srcA.length < 8 || srcB.length < 8 || srcA === srcB) continue;
+
+    const trA = normalizeForDupCheck(translationMap.get(a.id) || '');
+    const trB = normalizeForDupCheck(translationMap.get(b.id) || '');
+    if (trA.length >= 6 && trA === trB) {
+      suspiciousDupPairs++;
+    }
+  }
+  const consecutiveDuplicateShift = suspiciousDupPairs >= 2;
+
+  const shiftReasons: string[] = [];
+  if (unexpectedIds.length > 0) shiftReasons.push(`unexpectedIds(${unexpectedIds.slice(0, 5).join(',')})`);
+  if (duplicateIds.length > 0) shiftReasons.push(`duplicateIds(${duplicateIds.slice(0, 5).join(',')})`);
+  if (outOfOrderIds.length > 0) shiftReasons.push(`outOfOrderIds(${outOfOrderIds.slice(0, 5).join(',')})`);
+  if (tailDropShift) shiftReasons.push(`tailDropShift(${missingIds.slice(0, 5).join(',')})`);
+  if (consecutiveDuplicateShift) shiftReasons.push(`consecutiveDuplicateShift(${suspiciousDupPairs} pairs)`);
+
+  return {
+    translationMap,
+    unexpectedIds,
+    duplicateIds,
+    outOfOrderIds,
+    missingIds,
+    emptyIds,
+    tailDropShift,
+    consecutiveDuplicateShift,
+    hasShiftRisk: shiftReasons.length > 0,
+    shiftReasons,
+  };
+}
+
+/**
  * Normalizes OpenAI-compatible chat completion responses into the SubGame Lab internal format.
- * Validates complete structural and ID integrity (Requirement 24).
+ * Validates complete structural, anti-shift, and ID integrity (Requirement 24).
  */
 export function normalizeOpenAiTranslationResponse(
   data: any,
@@ -431,53 +612,37 @@ export function normalizeOpenAiTranslationResponse(
     throw jsonErr;
   }
 
-  const rawTranslations = parsed.translations;
-  const translationMap = new Map<number, string>();
-  const duplicateIds = new Set<number>();
+  const audit = auditBatchAlignment(originalItems, parsed.translations);
 
-  rawTranslations.forEach((t: any) => {
-    if (t && (typeof t.id === 'number' || typeof t.id === 'string')) {
-      const numId = Number(t.id);
-      if (!isNaN(numId)) {
-        if (translationMap.has(numId)) {
-          duplicateIds.add(numId);
-        }
-        translationMap.set(numId, String(t.text ?? ''));
-      }
-    }
-  });
+  // Strict Anti-Shift Audit:
+  // Unexpected, duplicate, out-of-order, tail-drop cue-merge, or consecutive-duplicate shifts
+  // indicate the model drifted across subtitle timestamps! Reject immediately.
+  if (audit.hasShiftRisk) {
+    const shiftErr: any = new Error(
+      `Cue alignment shift detected (${audit.shiftReasons.join('; ')}). Rejecting batch to prevent timestamp drift.`
+    );
+    shiftErr.errorType = 'id_alignment_mismatch';
+    shiftErr.retryable = true;
+    shiftErr.status = 502;
+    throw shiftErr;
+  }
 
   // Strict Completeness Audit (Rule 24):
-  // Check if any original items are missing from the provider response
-  const missingItemIds: number[] = [];
-  const emptyTranslatedItemIds: number[] = [];
-
-  const verifiedTranslations = originalItems.map((item) => {
-    if (!translationMap.has(item.id)) {
-      missingItemIds.push(item.id);
-      return { id: item.id, text: '' };
-    }
-    const translatedStr = translationMap.get(item.id)!;
-    // Check if input was non-empty but translation returned blank
-    if (item.text && item.text.trim().length > 0 && (!translatedStr || translatedStr.trim().length === 0)) {
-      emptyTranslatedItemIds.push(item.id);
-    }
-    return {
-      id: item.id,
-      text: translatedStr,
-    };
-  });
-
-  // If items are missing from the provider response, do NOT pretend it succeeded!
-  if (missingItemIds.length > 0) {
+  if (audit.missingIds.length > 0 || audit.emptyIds.length > 0) {
+    const badIds = Array.from(new Set([...audit.missingIds, ...audit.emptyIds]));
     const missingErr: any = new Error(
-      `Custom provider omitted ${missingItemIds.length} of ${originalItems.length} items (IDs: ${missingItemIds.slice(0, 5).join(', ')}${missingItemIds.length > 5 ? '...' : ''}).`
+      `Custom provider omitted or blanked ${badIds.length} of ${originalItems.length} items (IDs: ${badIds.slice(0, 5).join(', ')}${badIds.length > 5 ? '...' : ''}).`
     );
     missingErr.errorType = 'missing_translations';
     missingErr.retryable = true;
     missingErr.status = 502;
     throw missingErr;
   }
+
+  const verifiedTranslations = originalItems.map((item) => ({
+    id: item.id,
+    text: audit.translationMap.get(item.id) ?? '',
+  }));
 
   return {
     translations: verifiedTranslations,

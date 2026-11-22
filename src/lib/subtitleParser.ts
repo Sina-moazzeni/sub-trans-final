@@ -1,929 +1,1183 @@
-import { SubtitleFormat, SubtitleItem } from '../types';
-import { detectEncodingAndDecodeText } from './encodingHelper';
+import { SubtitleItem, SubtitleFormat, SubtitleCueSpan } from '../types';
+import { detectEncodingAndDecodeText as detectEncodingAndDecode } from './encodingHelper';
+
+export { detectEncodingAndDecode };
+
+// ============================================================================
+// SUBTITLE TIMING & FORMAT ENGINE
+// ZERO-DRIFT INTEGER-MILLISECOND + LOSSLESS SOURCE-TEMPLATE SPLICING ARCHITECTURE
+// ============================================================================
+
+export const RTL_LANGUAGES = ['fa', 'ar', 'he', 'ur', 'ps', 'ckb', 'ku', 'sd'];
+
+const PERSIAN_ARABIC_DIGITS: Record<string, string> = {
+  '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+  '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+  '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+  '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+};
+
+const HIDDEN_BIDI_RE = /[\uFEFF\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
 
 /**
- * Detect text encoding from ArrayBuffer using enhanced detector with jschardet and Persian Windows-1256 fallback
+ * Converts any Persian (۰-۹) or Arabic-Indic (٠-٩) numerals to standard ASCII English digits (0-9).
  */
-export function detectEncodingAndDecode(buffer: ArrayBuffer, forcedEncoding?: string): { text: string; encoding: string } {
-  const result = detectEncodingAndDecodeText(buffer, forcedEncoding);
-  return { text: result.text, encoding: result.encoding };
+export function toEnglishDigits(str: string): string {
+  if (!str) return '';
+  return String(str).replace(/[۰-۹٠-٩]/g, (ch) => PERSIAN_ARABIC_DIGITS[ch] ?? ch);
 }
 
 /**
- * Normalize Persian (۰-۹) and Arabic-Indic (٠-٩) digits to strict ASCII English digits (0-9)
- * and strip directional/invisible bidi control marks so timestamps are always machine-readable.
+ * Strict timestamp-to-integer-milliseconds parser.
+ * Supports:
+ * - HH:MM:SS.mmm / HH:MM:SS,mmm (1-4 digit hours, 1-6 fractional digits)
+ * - MM:SS.mmm / MM:SS,mmm (W3C WebVTT short form)
+ * - HH:MM:SS / MM:SS (no fractional component)
+ * - H:MM:SS.cc (ASS/SSA centiseconds — 2 fractional digits -> *10 ms)
+ *
+ * Uses pure integer arithmetic to guarantee ZERO floating-point rounding drift.
+ * Returns null if the input is not a valid timestamp.
  */
-export function toEnglishDigits(input: string): string {
-  if (!input) return '';
-  return input
-    .replace(/[\u06F0-\u06F9]/g, (ch) => String(ch.charCodeAt(0) - 0x06f0))
-    .replace(/[\u0660-\u0669]/g, (ch) => String(ch.charCodeAt(0) - 0x0660))
-    .replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '');
-}
+export function parseTimestampToMs(raw: string): number | null {
+  if (!raw || typeof raw !== 'string') return null;
 
-/**
- * Convert timestamp (e.g. "00:01:20,500" or "00:01:20.500" or "0:01:20.50") to seconds
- */
-export function timestampToSeconds(timeStr: string): number {
-  if (!timeStr) return 0;
-  const cleaned = toEnglishDigits(timeStr).trim().replace(',', '.');
-  const parts = cleaned.split(':');
-  if (parts.length === 3) {
-    const hours = parseFloat(parts[0]) || 0;
-    const minutes = parseFloat(parts[1]) || 0;
-    const seconds = parseFloat(parts[2]) || 0;
-    const total = hours * 3600 + minutes * 60 + seconds;
-    return isFinite(total) && total >= 0 ? total : 0;
+  const cleaned = toEnglishDigits(raw)
+    .replace(HIDDEN_BIDI_RE, '')
+    .trim();
+
+  if (!cleaned) return null;
+
+  // Require at least MM:SS (at least one colon) so plain numbers never parse as timestamps
+  const match = cleaned.match(
+    /^(\d{1,4}):(\d{1,2})(?::(\d{1,2}))?(?:[.,](\d{1,6}))?$/
+  );
+  if (!match) return null;
+
+  let hours = 0;
+  let minutes = 0;
+  let seconds = 0;
+
+  if (match[3] !== undefined) {
+    // HH:MM:SS(.frac)
+    hours = parseInt(match[1], 10);
+    minutes = parseInt(match[2], 10);
+    seconds = parseInt(match[3], 10);
+  } else {
+    // MM:SS(.frac)
+    minutes = parseInt(match[1], 10);
+    seconds = parseInt(match[2], 10);
   }
-  if (parts.length === 2) {
-    const minutes = parseFloat(parts[0]) || 0;
-    const seconds = parseFloat(parts[1]) || 0;
-    const total = minutes * 60 + seconds;
-    return isFinite(total) && total >= 0 ? total : 0;
+
+  let ms = 0;
+  if (match[4] !== undefined) {
+    const frac = match[4];
+    if (frac.length === 1) {
+      ms = parseInt(frac, 10) * 100;
+    } else if (frac.length === 2) {
+      ms = parseInt(frac, 10) * 10;
+    } else if (frac.length === 3) {
+      ms = parseInt(frac, 10);
+    } else {
+      // 4-6 fractional digits (microseconds) -> round cleanly to nearest integer ms
+      ms = Math.round(parseInt(frac.slice(0, 6).padEnd(6, '0'), 10) / 1000);
+    }
   }
-  const direct = parseFloat(cleaned) || 0;
-  return isFinite(direct) && direct >= 0 ? direct : 0;
+
+  if (
+    !Number.isFinite(hours) ||
+    !Number.isFinite(minutes) ||
+    !Number.isFinite(seconds) ||
+    !Number.isFinite(ms) ||
+    hours < 0 ||
+    minutes < 0 ||
+    seconds < 0
+  ) {
+    return null;
+  }
+
+  return ((hours * 3600) + (minutes * 60) + seconds) * 1000 + ms;
 }
 
 /**
- * Validates and sanitizes start/end timecodes ensuring non-negative, finite numbers and end >= start
+ * Formats integer milliseconds into canonical ASCII SRT timestamp: HH:MM:SS,mmm
  */
-export function validateAndSanitizeTimecodes(startSec: number, endSec: number): { start: number; end: number } {
-  const safeStart = isFinite(startSec) && startSec >= 0 ? startSec : 0;
-  let safeEnd = isFinite(endSec) && endSec >= 0 ? endSec : safeStart + 2;
-  if (safeEnd < safeStart) {
-    safeEnd = safeStart + 0.5;
-  }
-  return { start: safeStart, end: safeEnd };
+export function formatMsToSRT(totalMs: number): string {
+  const safeMs = Number.isFinite(totalMs) ? Math.max(0, Math.round(totalMs)) : 0;
+  const hrs = Math.floor(safeMs / 3_600_000);
+  const mins = Math.floor((safeMs % 3_600_000) / 60_000);
+  const secs = Math.floor((safeMs % 60_000) / 1000);
+  const ms = safeMs % 1000;
+
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
 }
 
 /**
- * Format seconds to SRT format: "00:01:20,500"
- * Uses mathematical total millisecond rollover so ms never equals 1000 and s never equals 60.
+ * Formats integer milliseconds into canonical ASCII WebVTT timestamp: HH:MM:SS.mmm
+ */
+export function formatMsToVTT(totalMs: number): string {
+  const safeMs = Number.isFinite(totalMs) ? Math.max(0, Math.round(totalMs)) : 0;
+  const hrs = Math.floor(safeMs / 3_600_000);
+  const mins = Math.floor((safeMs % 3_600_000) / 60_000);
+  const secs = Math.floor((safeMs % 60_000) / 1000);
+  const ms = safeMs % 1000;
+
+  return `${String(hrs).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
+}
+
+/**
+ * Formats integer milliseconds into canonical ASCII ASS/SSA timestamp: H:MM:SS.cc
+ */
+export function formatMsToASS(totalMs: number): string {
+  const safeMs = Number.isFinite(totalMs) ? Math.max(0, Math.round(totalMs)) : 0;
+  const totalCs = Math.round(safeMs / 10);
+  const hrs = Math.floor(totalCs / 360_000);
+  const mins = Math.floor((totalCs % 360_000) / 6_000);
+  const secs = Math.floor((totalCs % 6_000) / 100);
+  const cs = totalCs % 100;
+
+  return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${String(cs).padStart(2, '0')}`;
+}
+
+/**
+ * Parses a timestamp string into seconds (derived from exact integer ms).
+ */
+export function timestampToSeconds(timestamp: string): number {
+  const ms = parseTimestampToMs(timestamp);
+  return ms !== null ? ms / 1000 : 0;
+}
+
+/**
+ * Formats seconds into canonical SRT format: HH:MM:SS,mmm
  */
 export function secondsToSRT(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) seconds = 0;
-  const totalMs = Math.round(seconds * 1000);
-  const ms = totalMs % 1000;
-  const totalSec = Math.floor(totalMs / 1000);
-  const s = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const m = totalMin % 60;
-  const h = Math.floor(totalMin / 60);
-  const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)},${pad(ms, 3)}`;
+  if (!Number.isFinite(seconds) || seconds < 0) return '00:00:00,000';
+  return formatMsToSRT(Math.round(seconds * 1000));
 }
 
 /**
- * Format seconds to VTT format: "00:01:20.500"
+ * Formats seconds into canonical WebVTT format: HH:MM:SS.mmm
  */
 export function secondsToVTT(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) seconds = 0;
-  const totalMs = Math.round(seconds * 1000);
-  const ms = totalMs % 1000;
-  const totalSec = Math.floor(totalMs / 1000);
-  const s = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const m = totalMin % 60;
-  const h = Math.floor(totalMin / 60);
-  const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-  return `${pad(h, 2)}:${pad(m, 2)}:${pad(s, 2)}.${pad(ms, 3)}`;
+  if (!Number.isFinite(seconds) || seconds < 0) return '00:00:00.000';
+  return formatMsToVTT(Math.round(seconds * 1000));
 }
 
 /**
- * Format seconds to ASS/SSA format: "0:01:20.50"
- * Uses mathematical total centisecond rollover so cs never equals 100 and s never equals 60.
+ * Formats seconds into canonical ASS/SSA format: H:MM:SS.cc
  */
 export function secondsToASS(seconds: number): string {
-  if (!isFinite(seconds) || seconds < 0) seconds = 0;
-  const totalCs = Math.round(seconds * 100);
-  const cs = totalCs % 100;
-  const totalSec = Math.floor(totalCs / 100);
-  const s = totalSec % 60;
-  const totalMin = Math.floor(totalSec / 60);
-  const m = totalMin % 60;
-  const h = Math.floor(totalMin / 60);
-  const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-  return `${h}:${pad(m, 2)}:${pad(s, 2)}.${pad(cs, 2)}`;
+  if (!Number.isFinite(seconds) || seconds < 0) return '0:00:00.00';
+  return formatMsToASS(Math.round(seconds * 1000));
 }
 
 /**
- * Parse raw timestamp string into integer { h, m, s, ms } with zero floating-point math
+ * Formats seconds into MicroDVD frame number.
  */
-function parseTimestampParts(raw?: string): { h: number; m: number; s: number; ms: number } | null {
-  if (!raw) return null;
-  const cleaned = toEnglishDigits(raw).trim();
-  const match = cleaned.match(/^(\d{1,4}):(\d{1,2}):(\d{1,2})(?:[.,](\d+))?$/);
-  if (match) {
-    let h = parseInt(match[1], 10);
-    let m = parseInt(match[2], 10);
-    let s = parseInt(match[3], 10);
-    const frac = match[4] || '0';
-    let ms = frac.length === 1
-      ? parseInt(frac, 10) * 100
-      : frac.length === 2
-        ? parseInt(frac, 10) * 10
-        : frac.length === 3
-          ? parseInt(frac, 10)
-          : Math.round(parseFloat(`0.${frac}`) * 1000);
-    if (ms >= 1000) {
-      s += Math.floor(ms / 1000);
-      ms = ms % 1000;
-    }
-    if (s >= 60) {
-      m += Math.floor(s / 60);
-      s = s % 60;
-    }
-    if (m >= 60) {
-      h += Math.floor(m / 60);
-      m = m % 60;
-    }
-    if (h >= 0 && m >= 0 && s >= 0 && ms >= 0) {
-      return { h, m, s, ms };
-    }
-  }
-  // Support MM:SS.mmm (valid WebVTT short form without hours, including M >= 60 e.g. 65:12.300)
-  const shortMatch = cleaned.match(/^(\d{1,4}):(\d{1,2})(?:[.,](\d+))?$/);
-  if (shortMatch) {
-    let m = parseInt(shortMatch[1], 10);
-    let s = parseInt(shortMatch[2], 10);
-    const frac = shortMatch[3] || '0';
-    let ms = frac.length === 1
-      ? parseInt(frac, 10) * 100
-      : frac.length === 2
-        ? parseInt(frac, 10) * 10
-        : frac.length === 3
-          ? parseInt(frac, 10)
-          : Math.round(parseFloat(`0.${frac}`) * 1000);
-    if (ms >= 1000) {
-      s += Math.floor(ms / 1000);
-      ms = ms % 1000;
-    }
-    if (s >= 60) {
-      m += Math.floor(s / 60);
-      s = s % 60;
-    }
-    const h = Math.floor(m / 60);
-    m = m % 60;
-    if (h >= 0 && m >= 0 && s >= 0 && ms >= 0) {
-      return { h, m, s, ms };
-    }
-  }
-  return null;
+export function secondsToFrame(seconds: number, fps = 25): number {
+  const safeFps = fps > 0 && fps < 200 ? fps : 25;
+  if (!Number.isFinite(seconds) || seconds < 0) return 0;
+  return Math.max(0, Math.round(seconds * safeFps));
 }
 
 /**
- * Normalize raw timestamp directly to SRT format ("HH:MM:SS,mmm") without floating-point drift.
+ * Normalizes any valid timestamp string directly to canonical SRT format (HH:MM:SS,mmm)
+ * without passing through floating-point seconds.
  */
-export function normalizeTimestampToSRT(rawTimeStr: string | undefined, fallbackSeconds: number): string {
-  const parts = parseTimestampParts(rawTimeStr);
-  if (parts) {
-    const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-    return `${pad(parts.h, 2)}:${pad(parts.m, 2)}:${pad(parts.s, 2)},${pad(parts.ms, 3)}`;
-  }
+export function normalizeTimestampToSRT(rawTimestamp: string, fallbackSeconds = 0): string {
+  const ms = parseTimestampToMs(rawTimestamp);
+  if (ms !== null) return formatMsToSRT(ms);
   return secondsToSRT(fallbackSeconds);
 }
 
 /**
- * Normalize raw timestamp directly to VTT format ("HH:MM:SS.mmm") without floating-point drift.
+ * Normalizes any valid timestamp string directly to canonical VTT format (HH:MM:SS.mmm)
+ * without passing through floating-point seconds.
  */
-export function normalizeTimestampToVTT(rawTimeStr: string | undefined, fallbackSeconds: number): string {
-  const parts = parseTimestampParts(rawTimeStr);
-  if (parts) {
-    const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-    return `${pad(parts.h, 2)}:${pad(parts.m, 2)}:${pad(parts.s, 2)}.${pad(parts.ms, 3)}`;
-  }
+export function normalizeTimestampToVTT(rawTimestamp: string, fallbackSeconds = 0): string {
+  const ms = parseTimestampToMs(rawTimestamp);
+  if (ms !== null) return formatMsToVTT(ms);
   return secondsToVTT(fallbackSeconds);
 }
 
 /**
- * Normalize raw timestamp directly to ASS/SSA format ("H:MM:SS.cc") without floating-point drift.
+ * Normalizes any valid timestamp string directly to canonical ASS format (H:MM:SS.cc)
+ * without passing through floating-point seconds.
  */
-export function normalizeTimestampToASS(rawTimeStr: string | undefined, fallbackSeconds: number): string {
-  const parts = parseTimestampParts(rawTimeStr);
-  if (parts) {
-    const pad = (num: number, size: number) => num.toString().padStart(size, '0');
-    const cs = Math.floor(parts.ms / 10);
-    return `${parts.h}:${pad(parts.m, 2)}:${pad(parts.s, 2)}.${pad(cs, 2)}`;
-  }
+export function normalizeTimestampToASS(rawTimestamp: string, fallbackSeconds = 0): string {
+  const ms = parseTimestampToMs(rawTimestamp);
+  if (ms !== null) return formatMsToASS(ms);
   return secondsToASS(fallbackSeconds);
 }
 
 /**
- * Format seconds to MicroDVD frame format with configurable FPS
+ * Resolves exact integer start & end milliseconds for any SubtitleItem.
+ * Priority:
+ *  1) item.startTime / item.endTime (preserves manual edits & time shifts, parsed in pure integer ms)
+ *  2) item.rawStartTime / item.rawEndTime (immutable original source timestamp)
+ *  3) item.startMs / item.endMs (exact integer ms stored at parse time)
+ *  4) item.startSeconds / item.endSeconds * 1000 (legacy fallback)
+ *
+ * Guarantees startMs >= 0 and endMs >= startMs WITHOUT altering valid timings by even 1ms.
  */
-export function secondsToFrame(seconds: number, fps = 25): number {
-  if (!isFinite(seconds) || seconds < 0) seconds = 0;
-  return Math.round(seconds * fps);
+export function resolveItemTimingMs(item: SubtitleItem): { startMs: number; endMs: number } {
+  let startMs =
+    parseTimestampToMs(item.startTime) ??
+    (item.rawStartTime ? parseTimestampToMs(item.rawStartTime) : null) ??
+    (typeof item.startMs === 'number' && Number.isFinite(item.startMs) ? Math.round(item.startMs) : null) ??
+    Math.round((Number.isFinite(item.startSeconds) ? item.startSeconds : 0) * 1000);
+
+  let endMs =
+    parseTimestampToMs(item.endTime) ??
+    (item.rawEndTime ? parseTimestampToMs(item.rawEndTime) : null) ??
+    (typeof item.endMs === 'number' && Number.isFinite(item.endMs) ? Math.round(item.endMs) : null) ??
+    Math.round((Number.isFinite(item.endSeconds) ? item.endSeconds : 0) * 1000);
+
+  if (startMs < 0) startMs = 0;
+  if (endMs < startMs) endMs = startMs;
+
+  return { startMs, endMs };
 }
 
 /**
- * Detect format from filename or content
+ * Backward-compatible validator/sanitizer for start/end seconds pair.
  */
-export function detectFormat(filename: string, content: string): SubtitleFormat {
-  const ext = filename.split('.').pop()?.toLowerCase();
+export function validateAndSanitizeTimecodes(
+  startSeconds: number,
+  endSeconds: number
+): { startSeconds: number; endSeconds: number } {
+  const start = Number.isFinite(startSeconds) && startSeconds >= 0 ? startSeconds : 0;
+  const end = Number.isFinite(endSeconds) && endSeconds >= start ? endSeconds : start;
+  return { startSeconds: start, endSeconds: end };
+}
+
+/**
+ * Fix RTL punctuation layout issues (e.g. question mark, semicolon)
+ * while preserving tags, line breaks, and clean UTF-8 text.
+ */
+export function fixRTLPunctuation(text: string): string {
+  if (!text) return '';
+  return text
+    .split('\n')
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return '';
+      if (/^[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF\s0-9.,!?؟،؛:"'()\-–—…«»]+$/.test(trimmed)) {
+        return trimmed.replace(/\?/g, '؟').replace(/;/g, '؛');
+      }
+      return trimmed;
+    })
+    .join('\n');
+}
+
+/**
+ * Strips any hallucinated/echoed SRT/VTT cue headers or timestamp lines from AI-returned text
+ * so a rogue timestamp inside a translation can NEVER break VTT/SRT cue boundaries.
+ */
+export function stripHallucinatedTimestamps(text: string): string {
+  if (!text || typeof text !== 'string') return '';
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = normalized.split('\n');
+  const cleanedLines: string[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (matchTimingLine(line)) {
+      // If the immediately preceding line we just pushed was a lone cue index number before this echoed timestamp, drop it too
+      if (
+        cleanedLines.length > 0 &&
+        /^\d+$/.test(toEnglishDigits(cleanedLines[cleanedLines.length - 1]).trim())
+      ) {
+        cleanedLines.pop();
+      }
+      continue;
+    }
+    cleanedLines.push(line);
+  }
+
+  return cleanedLines.join('\n').trim();
+}
+
+/**
+ * Sanitizes cue text payload for SRT / WebVTT output so it can NEVER break block boundaries
+ * or trick video stream players into mis-parsing subsequent cues:
+ * - Normalizes CRLF/CR to LF
+ * - Strips hallucinated timestamp lines
+ * - Removes empty blank lines inside a cue body (blank lines terminate VTT/SRT cues!)
+ * - Replaces literal "-->" inside dialogue text with "→"
+ */
+export function sanitizeCuePayloadText(
+  text: string,
+  isRTL: boolean,
+  appendRTLMarkers: boolean
+): string {
+  const withoutEchoedTimings = stripHallucinatedTimestamps(String(text ?? ''));
+  const normalized = withoutEchoedTimings
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .replace(/-->/g, '→');
+
+  const lines = normalized
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0);
+
+  if (lines.length === 0) return '';
+
+  const joined = lines.join('\n');
+  const formatted = isRTL ? fixRTLPunctuation(joined) : joined;
+
+  if (isRTL && appendRTLMarkers) {
+    return formatted
+      .split('\n')
+      .map((line) => (line.trim() && !line.endsWith('\u200F') ? `${line}\u200F` : line))
+      .join('\n');
+  }
+
+  return formatted;
+}
+
+/**
+ * Extracts ONLY valid W3C WebVTT cue settings tokens (vertical, line, position, size, align, region)
+ * so arbitrary garbage or ASS style tags never corrupt a WebVTT timing line.
+ */
+function extractValidVttCueSettings(raw?: string): string {
+  if (!raw || typeof raw !== 'string') return '';
+  const tokens = raw
+    .replace(HIDDEN_BIDI_RE, '')
+    .replace(/[\r\n]+/g, ' ')
+    .trim()
+    .split(/\s+/)
+    .filter((tok) => /^(?:vertical|line|position|size|align|region):[^\s]+$/i.test(tok));
+  return tokens.join(' ');
+}
+
+export interface ParsedSubtitleResult {
+  items: SubtitleItem[];
+  format: SubtitleFormat;
+  rawHeader?: string;
+  rawSourceText?: string;
+  sourceCueSpans?: SubtitleCueSpan[];
+  subFps?: number;
+  warnings?: string[];
+  hasXTimestampMap?: boolean;
+}
+
+export interface SourceTemplateExportMeta {
+  rawSourceText?: string;
+  sourceFormat?: SubtitleFormat;
+  sourceCueSpans?: SubtitleCueSpan[];
+}
+
+// ============================================================================
+// STRICT CUE TIMING REGEX (SHARED BY SRT & WEBVTT PARSERS)
+// Requires at least MM:SS (one colon) on BOTH start and end so dialogue like
+// "1 --> 2" can NEVER falsely split a subtitle cue!
+// ============================================================================
+const CUE_TIMING_LINE_RE =
+  /^\s*((?:\d{1,4}:)?\d{1,2}:\d{1,2}(?:[.,]\d{1,6})?)\s*-->\s*((?:\d{1,4}:)?\d{1,2}:\d{1,2}(?:[.,]\d{1,6})?)(?:\s+(.*))?$/;
+
+interface MatchedTimingLine {
+  startRaw: string;
+  endRaw: string;
+  startMs: number;
+  endMs: number;
+  settings: string;
+}
+
+function matchTimingLine(line: string): MatchedTimingLine | null {
+  if (!line || !line.includes('-->')) return null;
+  const cleaned = toEnglishDigits(line).replace(HIDDEN_BIDI_RE, '');
+  const m = cleaned.match(CUE_TIMING_LINE_RE);
+  if (!m) return null;
+
+  const startRaw = m[1].trim();
+  const endRaw = m[2].trim();
+  const startMs = parseTimestampToMs(startRaw);
+  const endMs = parseTimestampToMs(endRaw);
+  if (startMs === null || endMs === null) return null;
+
+  return {
+    startRaw,
+    endRaw,
+    startMs,
+    endMs,
+    settings: (m[3] || '').trim(),
+  };
+}
+
+/**
+ * Computes exact UTF-16 character start & end offsets for every line in LF-normalized text.
+ * Enables 100% lossless byte-for-byte source-template splicing on export.
+ */
+function computeLineOffsets(normalizedText: string): {
+  lines: string[];
+  lineStarts: number[];
+  lineEnds: number[];
+} {
+  const lines = normalizedText.split('\n');
+  const lineStarts: number[] = new Array(lines.length);
+  const lineEnds: number[] = new Array(lines.length);
+  let pos = 0;
+  for (let i = 0; i < lines.length; i++) {
+    lineStarts[i] = pos;
+    pos += lines[i].length;
+    lineEnds[i] = pos;
+    pos += 1; // '\n'
+  }
+  return { lines, lineStarts, lineEnds };
+}
+
+/**
+ * Content-First Subtitle Format Detector:
+ * Inspects actual file content signature BEFORE extension so renamed files
+ * (e.g. a WebVTT file saved as .srt or .txt) are NEVER mis-parsed!
+ */
+export function detectFormat(content: string, fileName: string): SubtitleFormat {
+  const cleanHead = String(content || '').replace(/^\uFEFF/, '').trimStart();
+
+  // 1. Content signatures take highest precedence
+  if (/^WEBVTT(?:\s|$)/i.test(cleanHead)) {
+    return 'vtt';
+  }
+  if (/^\[Script Info\]/im.test(cleanHead.slice(0, 4000)) || /^Dialogue:\s*\d+,/im.test(cleanHead.slice(0, 4000))) {
+    return cleanHead.toLowerCase().includes('[v4 styles]') ? 'ssa' : 'ass';
+  }
+  if (/^\{\d+\}\{\d+\}/.test(cleanHead)) {
+    return 'sub';
+  }
+
+  // 2. Fall back to extension when content is standard timestamp-based
+  const ext = (fileName || '').split('.').pop()?.toLowerCase() || '';
   if (ext === 'vtt') return 'vtt';
   if (ext === 'ass') return 'ass';
   if (ext === 'ssa') return 'ssa';
   if (ext === 'sub') return 'sub';
-  if (ext === 'srt') return 'srt';
-
-  const cleanContent = content.replace(/^\uFEFF/, '').trimStart();
-  if (cleanContent.startsWith('WEBVTT') || cleanContent.includes('\nWEBVTT')) return 'vtt';
-  if (cleanContent.includes('[Script Info]') || cleanContent.includes('Dialogue:')) return 'ass';
-  if (/^\{\d+\}\{\d+\}/m.test(cleanContent)) return 'sub';
 
   return 'srt';
 }
 
 /**
- * Main parser for subtitle files
- * FIX (B13/B14/B16/L8/L9): result now carries optional `warnings` (skipped/orphan blocks)
- * and `subFps` (MicroDVD FPS detected from the header) so exports stay faithful.
+ * Ground-Up W3C Spec-Compliant SRT Parser with Exact Source-Span Tracking
+ * - Anchors strictly on validated timestamp lines
+ * - Preserves exact integer millisecond timestamps, raw strings, and character spans
+ * - Never injects fake 00:00:00,000 orphan cues that shift cue IDs
  */
-export function parseSubtitleFile(content: string, filename: string): {
-  items: SubtitleItem[];
-  format: SubtitleFormat;
-  rawHeader?: string;
-  warnings?: string[];
-  subFps?: number;
-} {
-  const format = detectFormat(filename, content);
-  const normalized = content.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+export function parseSRT(content: string): ParsedSubtitleResult {
+  const cleanContent = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
 
-  switch (format) {
-    case 'vtt':
-      return parseVTT(normalized);
-    case 'ass':
-    case 'ssa':
-      return parseASS(normalized, format);
-    case 'sub':
-      return parseSUB(normalized);
-    case 'srt':
-    default:
-      return parseSRT(normalized);
-  }
-}
-
-/**
- * SRT Parser - Timestamp Regex Anchored Block Extraction with timecode validation
- */
-function parseSRT(content: string): { items: SubtitleItem[]; format: SubtitleFormat; warnings?: string[] } {
-  const text = content.trim();
+  const { lines, lineStarts, lineEnds } = computeLineOffsets(cleanContent);
   const items: SubtitleItem[] = [];
-
-  const timestampRegex = /^[ \t]*([0-9\u06F0-\u06F9\u0660-\u0669]{1,4}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}(?:[.,][0-9\u06F0-\u06F9\u0660-\u0669]{1,6})?)[ \t]*-->[ \t]*([0-9\u06F0-\u06F9\u0660-\u0669]{1,4}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}:[0-9\u06F0-\u06F9\u0660-\u0669]{1,2}(?:[.,][0-9\u06F0-\u06F9\u0660-\u0669]{1,6})?)[^\n]*/gm;
-  
-  const matches: { index: number; startStr: string; endStr: string; fullMatch: string }[] = [];
-  let match: RegExpExecArray | null;
-
-  while ((match = timestampRegex.exec(text)) !== null) {
-    matches.push({
-      index: match.index,
-      startStr: toEnglishDigits(match[1]),
-      endStr: toEnglishDigits(match[2]),
-      fullMatch: match[0],
-    });
-  }
-
-  if (matches.length === 0) {
-    return parseSRTFallback(text);
-  }
-
-  // FIX (B13): text that appears BEFORE the first timestamp used to be silently dropped.
-  // Real cue numbers ("1") are ignored, but any other non-empty content becomes an orphan
-  // cue at t=0 so the user's data is never lost silently.
+  const sourceCueSpans: SubtitleCueSpan[] = [];
   const warnings: string[] = [];
-  const firstTimestamp = matches[0];
-  if (firstTimestamp.index > 0) {
-    const orphanPart = text.substring(0, firstTimestamp.index).trim();
-    if (orphanPart) {
-      const orphanLines = orphanPart.split('\n').map((l) => l.trim()).filter(Boolean);
-      const meaningful = orphanLines.filter((l) => !/^\d+$/.test(l));
-      if (meaningful.length > 0) {
-        items.push({
-          id: items.length + 1,
-          startTime: '00:00:00,000',
-          endTime: '00:00:00,000',
-          startSeconds: 0,
-          endSeconds: 0,
-          originalText: meaningful.join('\n'),
-          translatedText: '',
-        });
-        warnings.push(`یک بلوک متنی قبل از نخستین تایم‌استمپ بدون زمان به‌عنوان کیو حفظ شد (${meaningful.length} خط).`);
-      }
-    }
-  }
 
-  for (let i = 0; i < matches.length; i++) {
-    const current = matches[i];
-    const nextMatchIndex = i + 1 < matches.length ? matches[i + 1].index : text.length;
-
-    const afterTimestampIndex = current.index + current.fullMatch.length;
-    let blockTextPart = text.substring(afterTimestampIndex, nextMatchIndex);
-
-    if (i + 1 < matches.length) {
-      const textLines = blockTextPart.split('\n');
-      while (textLines.length > 0 && textLines[textLines.length - 1].trim() === '') {
-        textLines.pop();
-      }
-      // Trailing all-digits line immediately before the next timestamp is the next cue's index
-      // if it matches expected sequence OR is separated by a blank line (handles skipped cue numbers in English SRTs).
-      if (textLines.length > 0 && /^[0-9\u06F0-\u06F9\u0660-\u0669]+$/.test(textLines[textLines.length - 1].trim())) {
-        const trailingNumber = parseInt(toEnglishDigits(textLines[textLines.length - 1].trim()), 10);
-        const hasBlankLineAbove = textLines.length >= 2 && textLines[textLines.length - 2].trim() === '';
-        if (trailingNumber === i + 2 || trailingNumber === items.length + 2 || hasBlankLineAbove) {
-          textLines.pop();
-        }
-      }
-      blockTextPart = textLines.join('\n');
-    }
-
-    const cleanedText = blockTextPart.trim();
-    const rawStart = timestampToSeconds(current.startStr);
-    const rawEnd = timestampToSeconds(current.endStr);
-    const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
-    const endWasFixed = rawEnd < rawStart;
-
-    items.push({
-      id: items.length + 1,
-      startTime: normalizeTimestampToSRT(current.startStr, startSec),
-      endTime: endWasFixed ? secondsToSRT(endSec) : normalizeTimestampToSRT(current.endStr, endSec),
-      startSeconds: startSec,
-      endSeconds: endSec,
-      originalText: cleanedText,
-      translatedText: '',
-    });
-  }
-
-  // Preserve the load-warning for the UI (added by the B13 orphan-cue handling above)
-  return warnings.length > 0 ? { items, format: 'srt' as SubtitleFormat, warnings } : { items, format: 'srt' as SubtitleFormat };
-}
-
-function parseSRTFallback(text: string): { items: SubtitleItem[]; format: SubtitleFormat } {
-  const blocks = text.split(/\n\s*\n+/);
-  const items: SubtitleItem[] = [];
-  let autoId = 1;
-
-  for (const block of blocks) {
-    const lines = block.trim().split('\n').map((l) => l.trim()).filter(Boolean);
-    if (lines.length < 2) continue;
-
-    let timeLineIdx = 0;
-    if (/^\d+$/.test(lines[0])) {
-      timeLineIdx = 1;
-    }
-
-    const timeLine = lines[timeLineIdx];
-    if (!timeLine || !timeLine.includes('-->')) continue;
-
-    const [startStr, endStr] = timeLine.split('-->').map((s) => s.trim());
-    const textLines = lines.slice(timeLineIdx + 1).join('\n');
-
-    const rawStart = timestampToSeconds(startStr);
-    const rawEnd = timestampToSeconds(endStr);
-    const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
-
-    items.push({
-      id: autoId++,
-      startTime: startStr.replace('.', ','),
-      endTime: endStr.replace('.', ','),
-      startSeconds: startSec,
-      endSeconds: endSec,
-      originalText: textLines,
-      translatedText: '',
-    });
-  }
-
-  return { items, format: 'srt' };
-}
-
-/**
- * WebVTT Parser preserving NOTE, STYLE, REGION header sections and cue settings
- * FIX (L9): mid-file NOTE/STYLE/REGION blocks are no longer merged into cue text (they are
- * preserved verbatim into the header), and cue identifier lines (e.g. "cue-1") are kept on the
- * item as `cueId` so the export can restore them.
- */
-const isVttTimestampLine = (raw: string): boolean => {
-  const trimmed = toEnglishDigits(raw).trim();
-  return /^(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?\s*-->\s*(?:(?:\d{1,4}:)?\d{1,2}:)?\d{1,2}(?:[.,]\d+)?(?:\s+.*)?$/.test(trimmed);
-};
-
-function parseVTT(content: string): { items: SubtitleItem[]; format: SubtitleFormat; rawHeader?: string; warnings?: string[] } {
-  const lines = content.split('\n');
-  const items: SubtitleItem[] = [];
-  const headerBlocks: string[] = [];
-  const warnings: string[] = [];
-  let autoId = 1;
-
-  let inHeader = true;
-  let currentBlock: string[] = [];
-
-  // A block-level VTT construct (NOTE/STYLE/REGION) — only valid at block boundary, NEVER inside an active cue
-  const isBlockLevelKeyword = (raw: string) => /^(NOTE|STYLE|REGION)(?:\s|$)/i.test(raw.trim());
-
-  let hasXTimestampMap = false;
-  let hasInlineKaraokeTs = false;
-  let nonMonotonicCount = 0;
-
+  // Identify all valid timing line indices first for unambiguous cue boundary detection
+  const timingEntries: Array<{ lineIdx: number; timing: MatchedTimingLine }> = [];
   for (let i = 0; i < lines.length; i++) {
-    const rawLine = lines[i];
-    const line = rawLine.trim();
-
-    if (/^X-TIMESTAMP-MAP=/i.test(line)) {
-      hasXTimestampMap = true;
+    const matched = matchTimingLine(lines[i]);
+    if (matched) {
+      timingEntries.push({ lineIdx: i, timing: matched });
     }
+  }
 
-    // Check if line is a genuine WebVTT timestamp line
-    if (isVttTimestampLine(line)) {
-      inHeader = false;
-      // If currentBlock ALREADY has a cue timestamp, flush the prior cue first so back-to-back cues
-      // without a separating blank line never merge together or drop cue #2's timestamps!
-      if (currentBlock.some((l) => isVttTimestampLine(l))) {
-        const lastLine = toEnglishDigits(currentBlock[currentBlock.length - 1] || '').trim();
-        const looksLikeCueId =
-          currentBlock.length >= 3 &&
-          !isVttTimestampLine(lastLine) &&
-          (/^\d+$/.test(lastLine) || /^(?:cue|c|id|sub)[-_]?\d+$/i.test(lastLine) || /^[A-Za-z0-9]+[-_][A-Za-z0-9_.-]+$/.test(lastLine));
+  for (let idx = 0; idx < timingEntries.length; idx++) {
+    const { lineIdx, timing } = timingEntries[idx];
+    const nextTimingLineIdx = idx + 1 < timingEntries.length ? timingEntries[idx + 1].lineIdx : lines.length;
 
-        if (looksLikeCueId) {
-          const carriedCueId = currentBlock.pop()!;
-          processVTTBlock(currentBlock, autoId++, items);
-          currentBlock = [carriedCueId];
-        } else {
-          processVTTBlock(currentBlock, autoId++, items);
-          currentBlock = [];
+    // Determine end of current cue payload (stop before next cue's optional numeric index & blank lines)
+    let payloadEnd = nextTimingLineIdx;
+    if (idx + 1 < timingEntries.length) {
+      let cursor = nextTimingLineIdx - 1;
+      if (cursor > lineIdx) {
+        const maybeIndexLine = toEnglishDigits(lines[cursor]).replace(HIDDEN_BIDI_RE, '').trim();
+        if (/^\d+$/.test(maybeIndexLine)) {
+          const beforeIndexIsBlank =
+            cursor - 1 <= lineIdx || lines[cursor - 1].trim() === '';
+          if (beforeIndexIsBlank || cursor > lineIdx + 1) {
+            cursor--;
+          }
         }
       }
-      currentBlock.push(rawLine);
-      continue;
-    }
-
-    if (inHeader) {
-      headerBlocks.push(rawLine);
-      if (line === '' && headerBlocks.some((l) => l.trim() !== '')) {
-        inHeader = false;
+      while (cursor > lineIdx && lines[cursor].trim() === '') {
+        cursor--;
       }
-      continue;
-    }
-
-    // Only treat NOTE/STYLE/REGION as block-level metadata when NOT already inside a cue
-    if (currentBlock.length === 0 && isBlockLevelKeyword(rawLine)) {
-      if (headerBlocks.length > 0 && headerBlocks[headerBlocks.length - 1].trim() !== '') {
-        headerBlocks.push('');
-      }
-      headerBlocks.push(rawLine);
-      while (i + 1 < lines.length && lines[i + 1].trim() !== '') {
-        i++;
-        headerBlocks.push(lines[i]);
-      }
-      continue;
-    }
-
-    if (line === '') {
-      if (currentBlock.length > 0) {
-        processVTTBlock(currentBlock, autoId++, items);
-        currentBlock = [];
-      }
+      payloadEnd = cursor + 1;
     } else {
-      if (/<\d{1,2}:\d{2}(?::\d{2})?[.,]\d{2,3}>/.test(rawLine)) {
-        hasInlineKaraokeTs = true;
+      let cursor = lines.length - 1;
+      while (cursor > lineIdx && lines[cursor].trim() === '') {
+        cursor--;
       }
-      currentBlock.push(rawLine);
+      payloadEnd = cursor + 1;
+    }
+
+    // Find exact first and last non-empty payload line indices for lossless source splicing
+    let firstPayloadLine = lineIdx + 1;
+    while (firstPayloadLine < payloadEnd && lines[firstPayloadLine].trim() === '') {
+      firstPayloadLine++;
+    }
+    let lastPayloadLine = payloadEnd - 1;
+    while (lastPayloadLine >= firstPayloadLine && lines[lastPayloadLine].trim() === '') {
+      lastPayloadLine--;
+    }
+
+    const textLines = firstPayloadLine <= lastPayloadLine
+      ? lines.slice(firstPayloadLine, lastPayloadLine + 1).map((l) => l.replace(/\r/g, '').trimEnd())
+      : [];
+
+    const originalText = textLines.join('\n').trim();
+    const startMs = Math.max(0, timing.startMs);
+    let endMs = timing.endMs;
+    if (endMs < startMs) {
+      warnings.push(`Cue #${items.length + 1}: end timestamp was earlier than start timestamp; clamped to start.`);
+      endMs = startMs;
+    }
+
+    const canonicalStart = formatMsToSRT(startMs);
+    const canonicalEnd = formatMsToSRT(endMs);
+    const cueNum = items.length + 1;
+
+    items.push({
+      id: cueNum,
+      startTime: canonicalStart,
+      endTime: canonicalEnd,
+      startSeconds: startMs / 1000,
+      endSeconds: endMs / 1000,
+      startMs,
+      endMs,
+      rawStartTime: timing.startRaw,
+      rawEndTime: timing.endRaw,
+      originalText,
+      translatedText: '',
+    });
+
+    if (firstPayloadLine <= lastPayloadLine) {
+      sourceCueSpans.push({
+        id: cueNum,
+        textStart: lineStarts[firstPayloadLine],
+        textEnd: lineEnds[lastPayloadLine],
+        startMs,
+        endMs,
+        startTime: canonicalStart,
+        endTime: canonicalEnd,
+      });
+    } else {
+      // Empty payload cue — anchor zero-width span right at end of timing line
+      sourceCueSpans.push({
+        id: cueNum,
+        textStart: lineEnds[lineIdx],
+        textEnd: lineEnds[lineIdx],
+        startMs,
+        endMs,
+        startTime: canonicalStart,
+        endTime: canonicalEnd,
+      });
     }
   }
-
-  if (currentBlock.length > 0) {
-    processVTTBlock(currentBlock, autoId++, items);
-  }
-
-  for (let idx = 1; idx < items.length; idx++) {
-    if (items[idx].startSeconds + 0.001 < items[idx - 1].startSeconds) {
-      nonMonotonicCount++;
-    }
-  }
-
-  if (hasXTimestampMap) {
-    warnings.push('این فایل VTT دارای هدر HLS (X-TIMESTAMP-MAP) است که در خروجی استاندارد حذف می‌شود تا تایم‌بندی در پلیرها جابه‌جا نشود.');
-  }
-  if (hasInlineKaraokeTs) {
-    warnings.push('فایل VTT ورودی دارای تایم‌کدهای درون‌خطی (شبیه زیرنویس خودکار یوتیوب) است.');
-  }
-  if (nonMonotonicCount > 0) {
-    warnings.push(`در خود فایل VTT ورودی ${nonMonotonicCount} مورد تایم‌بندی نامرتب یا هم‌پوشانی زمانی مشاهده شد.`);
-  }
-
-  // Strip X-TIMESTAMP-MAP from saved header so standalone exports never suffer HLS MPEGTS clock drift
-  const cleanedHeader = headerBlocks
-    .filter((l) => !/^X-TIMESTAMP-MAP=/i.test(l.trim()))
-    .join('\n')
-    .trim();
 
   return {
     items,
-    format: 'vtt',
-    rawHeader: cleanedHeader,
-    ...(warnings.length > 0 ? { warnings } : {}),
+    format: 'srt',
+    rawSourceText: cleanContent,
+    sourceCueSpans,
+    warnings: warnings.length > 0 ? warnings : undefined,
   };
 }
 
-function processVTTBlock(lines: string[], id: number, items: SubtitleItem[]) {
-  let timeLineIdx = -1;
+/**
+ * Ground-Up W3C Spec-Compliant WebVTT Parser with Exact Source-Span Tracking
+ * - Preserves 100% of original file structure for lossless template splicing:
+ *   WEBVTT, Kind:, Language:, X-TIMESTAMP-MAP, STYLE, REGION, mid-file NOTE blocks,
+ *   exact cue IDs, exact timestamp format (MM:SS.mmm or HH:MM:SS.mmm), and cue settings!
+ * - Properly ignores mid-file NOTE / STYLE / REGION blocks during cue parsing without
+ *   contaminating cue text or shifting cue IDs
+ * - Preserves exact integer millisecond startMs / endMs with 0ms drift
+ */
+export function parseVTT(content: string): ParsedSubtitleResult {
+  const cleanContent = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+
+  const { lines, lineStarts, lineEnds } = computeLineOffsets(cleanContent);
+  const items: SubtitleItem[] = [];
+  const sourceCueSpans: SubtitleCueSpan[] = [];
+  const warnings: string[] = [];
+
+  // Find the first valid cue timing line so we cleanly separate the WebVTT header from cue blocks
+  let firstTimingIdx = -1;
   for (let i = 0; i < lines.length; i++) {
-    if (isVttTimestampLine(lines[i])) {
-      timeLineIdx = i;
+    if (matchTimingLine(lines[i])) {
+      firstTimingIdx = i;
       break;
     }
   }
 
-  if (timeLineIdx === -1) return;
+  // Check if line immediately before firstTimingIdx is a cueId (not a VTT header/NOTE/STYLE/REGION)
+  let headerEndLineIdx = firstTimingIdx === -1 ? lines.length : firstTimingIdx;
+  if (firstTimingIdx > 0) {
+    const prevLine = lines[firstTimingIdx - 1].trim();
+    const prevPrevLine = firstTimingIdx >= 2 ? lines[firstTimingIdx - 2].trim() : '';
+    const isHeaderDirective =
+      /^WEBVTT\b/i.test(prevLine) ||
+      /^(?:Kind|Language|X-TIMESTAMP-MAP)\s*[:=]/i.test(prevLine) ||
+      /^(?:NOTE|STYLE|REGION)(?:\s|$)/.test(prevLine);
+    const isCueIdAfterBlankOrWebvtt =
+      prevLine !== '' &&
+      !isHeaderDirective &&
+      (prevPrevLine === '' || (/^\d+$/.test(toEnglishDigits(prevLine)) && /^WEBVTT\b/i.test(prevPrevLine)));
 
-  const timeLine = lines[timeLineIdx];
-  const parts = timeLine.split('-->');
-  if (parts.length < 2) return;
+    if (isCueIdAfterBlankOrWebvtt) {
+      headerEndLineIdx = firstTimingIdx - 1;
+    }
+  }
 
-  const startPart = toEnglishDigits(parts[0]).trim();
-  const endWithSettings = parts[1].trim();
+  // Build exact preserved VTT header (including X-TIMESTAMP-MAP, STYLE, REGION, Kind, Language)
+  const rawHeaderLines = lines.slice(0, headerEndLineIdx);
+  while (rawHeaderLines.length > 0 && rawHeaderLines[rawHeaderLines.length - 1].trim() === '') {
+    rawHeaderLines.pop();
+  }
+  const rawHeaderText = rawHeaderLines.join('\n').trim();
+  const hasXTimestampMap = /X-TIMESTAMP-MAP\s*=/i.test(rawHeaderText);
+  const rawHeader = rawHeaderText && /^WEBVTT\b/i.test(rawHeaderText)
+    ? rawHeaderText
+    : 'WEBVTT';
 
-  // WebVTT settings follow after end timestamp e.g. "00:01:25.000 line:0 position:20% align:start"
-  const endTokens = endWithSettings.split(/\s+/);
-  const endPart = toEnglishDigits(endTokens[0] || '').trim();
-  const settings = endTokens.slice(1).join(' ');
+  if (firstTimingIdx === -1) {
+    return {
+      items: [],
+      format: 'vtt',
+      rawHeader,
+      rawSourceText: cleanContent,
+      sourceCueSpans: [],
+      hasXTimestampMap,
+    };
+  }
 
-  const textLines = lines.slice(timeLineIdx + 1).join('\n').trim();
+  // Parse all blocks starting from headerEndLineIdx using a strict W3C WebVTT block state machine
+  let i = headerEndLineIdx;
+  while (i < lines.length) {
+    while (i < lines.length && lines[i].trim() === '') {
+      i++;
+    }
+    if (i >= lines.length) break;
 
-  // Capture cue identifier (any non-timestamp line(s) before the timestamp line)
-  const identifierLines = lines.slice(0, timeLineIdx).map((l) => l.trim()).filter(Boolean);
-  const cueId = identifierLines.length > 0 ? identifierLines[identifierLines.length - 1] : undefined;
+    const firstLine = lines[i].trim();
 
-  const rawStart = timestampToSeconds(startPart);
-  const rawEnd = timestampToSeconds(endPart);
-  const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
-  const endWasFixed = rawEnd < rawStart;
+    // Skip mid-file NOTE, STYLE, REGION blocks completely (up to next blank line)
+    if (
+      /^NOTE(?:\s|$)/.test(firstLine) ||
+      /^STYLE(?:\s|$)/.test(firstLine) ||
+      /^REGION(?:\s|$)/.test(firstLine)
+    ) {
+      i++;
+      while (i < lines.length && lines[i].trim() !== '') {
+        i++;
+      }
+      continue;
+    }
 
-  items.push({
-    id,
-    startTime: normalizeTimestampToVTT(startPart, startSec),
-    endTime: endWasFixed ? secondsToVTT(endSec) : normalizeTimestampToVTT(endPart, endSec),
-    startSeconds: startSec,
-    endSeconds: endSec,
-    originalText: textLines,
-    translatedText: '',
-    styleTags: settings || undefined,
-    cueId,
-  });
+    // Check whether line `i` is a cue timing line OR a cue identifier followed by a timing line
+    let cueId: string | undefined;
+    let timing = matchTimingLine(lines[i]);
+    let timingLineIdx = i;
+
+    if (!timing) {
+      if (i + 1 < lines.length && !lines[i].includes('-->')) {
+        const nextTiming = matchTimingLine(lines[i + 1]);
+        if (nextTiming) {
+          cueId = lines[i].trim();
+          timing = nextTiming;
+          i++; // advance to timing line
+          timingLineIdx = i;
+        }
+      }
+    }
+
+    if (!timing) {
+      i++;
+      continue;
+    }
+
+    // Advance past the timing line and collect cue payload lines with exact line indices
+    i++;
+    const payloadLineIndices: number[] = [];
+    const payloadLines: string[] = [];
+    while (i < lines.length) {
+      const curLine = lines[i];
+      const trimmedCur = curLine.trim();
+
+      // Blank line terminates cue per W3C WebVTT spec
+      if (trimmedCur === '') {
+        i++;
+        break;
+      }
+
+      // Defensive recovery for malformed VTTs missing blank lines between consecutive cues
+      if (matchTimingLine(curLine)) {
+        break;
+      }
+      if (/^(?:NOTE|STYLE|REGION)(?:\s|$)/.test(trimmedCur)) {
+        break;
+      }
+      if (
+        /^\d+$/.test(toEnglishDigits(trimmedCur).replace(HIDDEN_BIDI_RE, '')) &&
+        i + 1 < lines.length &&
+        matchTimingLine(lines[i + 1])
+      ) {
+        break;
+      }
+
+      payloadLineIndices.push(i);
+      payloadLines.push(curLine.replace(/\r/g, '').trimEnd());
+      i++;
+    }
+
+    const startMs = Math.max(0, timing.startMs);
+    let endMs = timing.endMs;
+    if (endMs < startMs) {
+      warnings.push(`Cue #${items.length + 1}: end timestamp was earlier than start timestamp; clamped to start.`);
+      endMs = startMs;
+    }
+
+    const canonicalStart = formatMsToVTT(startMs);
+    const canonicalEnd = formatMsToVTT(endMs);
+    const validCueSettings = extractValidVttCueSettings(timing.settings);
+    const cueNum = items.length + 1;
+
+    items.push({
+      id: cueNum,
+      startTime: canonicalStart,
+      endTime: canonicalEnd,
+      startSeconds: startMs / 1000,
+      endSeconds: endMs / 1000,
+      startMs,
+      endMs,
+      rawStartTime: timing.startRaw,
+      rawEndTime: timing.endRaw,
+      cueSettings: validCueSettings || undefined,
+      cueId: cueId || undefined,
+      originalText: payloadLines.join('\n').trim(),
+      translatedText: '',
+    });
+
+    if (payloadLineIndices.length > 0) {
+      const firstIdx = payloadLineIndices[0];
+      const lastIdx = payloadLineIndices[payloadLineIndices.length - 1];
+      sourceCueSpans.push({
+        id: cueNum,
+        textStart: lineStarts[firstIdx],
+        textEnd: lineEnds[lastIdx],
+        startMs,
+        endMs,
+        startTime: canonicalStart,
+        endTime: canonicalEnd,
+      });
+    } else {
+      sourceCueSpans.push({
+        id: cueNum,
+        textStart: lineEnds[timingLineIdx],
+        textEnd: lineEnds[timingLineIdx],
+        startMs,
+        endMs,
+        startTime: canonicalStart,
+        endTime: canonicalEnd,
+      });
+    }
+  }
+
+  return {
+    items,
+    format: 'vtt',
+    rawHeader,
+    rawSourceText: cleanContent,
+    sourceCueSpans,
+    hasXTimestampMap,
+    warnings: warnings.length > 0 ? warnings : undefined,
+  };
 }
 
 /**
- * ASS/SSA Parser with dynamic Format: column mapping
- * FIX (B10): `Comment:` events are no longer converted into translatable Dialogue items.
- * They are preserved verbatim (exact columns + text) in the raw header so the export writes
- * them back as real Comment lines — technical notes stay off-screen and out of the translator.
- * FIX (B16): events with FEWER fields than the Format line are salvaged by scanning for the
- * timestamp pair instead of producing shifted meaningless items; unpar­seable events are
- * counted and reported through `warnings`.
+ * Parse ASS / SSA Subtitle Format
  */
-function parseASS(content: string, format: SubtitleFormat): {
-  items: SubtitleItem[];
-  format: SubtitleFormat;
-  rawHeader?: string;
-  warnings?: string[];
-} {
-  const lines = content.split('\n');
+export function parseASS(content: string): ParsedSubtitleResult {
+  const cleanContent = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+
+  const lines = cleanContent.split('\n');
   const items: SubtitleItem[] = [];
   const headerLines: string[] = [];
-  const warnings: string[] = [];
-  let inEvents = false;
-  let eventFormatCols: string[] = ['layer', 'start', 'end', 'style', 'name', 'marginl', 'marginr', 'marginv', 'effect', 'text'];
-  let autoId = 1;
-
-  // An ASS timestamp like 0:00:01.00 or 1:23:45.67
-  const isAssTimestamp = (s: string) => /^\d+:\d{1,2}:\d{1,2}[.,]\d{1,3}$/.test(s.trim());
+  let inEventsSection = false;
+  let formatColumns: string[] = [];
 
   for (const line of lines) {
     const trimmed = line.trim();
 
-    if (trimmed.startsWith('[Events]')) {
-      inEvents = true;
+    if (trimmed.toLowerCase() === '[events]') {
+      inEventsSection = true;
       headerLines.push(line);
       continue;
     }
 
-    if (!inEvents) {
+    if (!inEventsSection) {
       headerLines.push(line);
       continue;
     }
 
-    if (trimmed.startsWith('Format:')) {
+    if (trimmed.toLowerCase().startsWith('format:')) {
       headerLines.push(line);
-      const colsRaw = trimmed.substring(7).trim();
-      eventFormatCols = colsRaw.split(',').map((c) => c.trim().toLowerCase());
+      formatColumns = trimmed
+        .substring(7)
+        .split(',')
+        .map((s) => s.trim().toLowerCase());
       continue;
     }
 
-    // FIX (B10): preserve Comment events verbatim — never translated, never displayed
-    if (trimmed.startsWith('Comment:')) {
-      headerLines.push(line);
-      continue;
-    }
+    if (trimmed.toLowerCase().startsWith('dialogue:')) {
+      const rest = line.substring(line.indexOf(':') + 1).trim();
+      const expectedParts = formatColumns.length > 0 ? formatColumns.length : 10;
+      const parts: string[] = [];
+      let currentIdx = 0;
 
-    if (trimmed.startsWith('Dialogue:')) {
-      const firstColonIdx = line.indexOf(':');
-      if (firstColonIdx === -1) continue;
-
-      const rest = line.substring(firstColonIdx + 1).trim();
-      
-      // Dynamic column parsing based on Format: specification
-      const startColIdx = eventFormatCols.indexOf('start');
-      const endColIdx = eventFormatCols.indexOf('end');
-      const textColIdx = eventFormatCols.indexOf('text');
-      const expectedFieldCount = eventFormatCols.length;
-
-      // FIX (B16): first split WITHOUT limits to count the real fields on this line
-      const allFields = rest.split(',').map((f) => f.trim());
-      const isMalformed = allFields.length < expectedFieldCount;
-
-      let startStr = '';
-      let endStr = '';
-      let rawText = '';
-      let prefixParts: string[] = [];
-
-      if (!isMalformed) {
-        // Healthy line: split up to textColIdx commas so text can contain commas
-        const splitLimit = Math.max(textColIdx !== -1 ? textColIdx : expectedFieldCount - 1, 1);
-        const parts: string[] = [];
-        let currentIdx = 0;
-
-        for (let p = 0; p < splitLimit; p++) {
-          const nextComma = rest.indexOf(',', currentIdx);
-          if (nextComma === -1) break;
-          parts.push(rest.substring(currentIdx, nextComma).trim());
-          currentIdx = nextComma + 1;
-        }
-        parts.push(rest.substring(currentIdx)); // Remainder is text
-
-        const startIdx = startColIdx !== -1 ? startColIdx : 1;
-        const endIdx = endColIdx !== -1 ? endColIdx : 2;
-        const textIdx = textColIdx !== -1 ? textColIdx : parts.length - 1;
-
-        startStr = parts[startIdx] || '';
-        endStr = parts[endIdx] || '';
-        rawText = parts[textIdx] || '';
-        prefixParts = parts.slice(0, textIdx);
-      } else {
-        // FIX (B16) salvage: locate the consecutive timestamp pair anywhere in the line.
-        // Fields before the start timestamp remain the prefix; everything after the end
-        // timestamp is the dialogue text (text may contain commas).
-        let tsIdx = -1;
-        for (let f = 0; f < allFields.length - 1; f++) {
-          if (isAssTimestamp(allFields[f]) && isAssTimestamp(allFields[f + 1])) {
-            tsIdx = f;
-            break;
-          }
-        }
-
-        if (tsIdx !== -1) {
-          startStr = allFields[tsIdx];
-          endStr = allFields[tsIdx + 1];
-          prefixParts = allFields.slice(0, tsIdx);
-          rawText = allFields.slice(tsIdx + 2).join(', ');
-          if (warnings.length === 0) {
-            warnings.push('تعدادی از رویدادهای ASS فیلد کمتری نسبت به خط Format داشتند و به‌صورت خودکار ترمیم شدند.');
-          }
-        } else {
-          // No timestamps at all — cannot build a playable event; report and skip.
-          if (warnings.length === 0) {
-            warnings.push('یک یا چند رویداد ASS فاقد تایم‌استمپ معتبر بود و از خروجی حذف شد.');
-          }
-          continue;
-        }
+      for (let i = 0; i < expectedParts - 1; i++) {
+        const commaIdx = rest.indexOf(',', currentIdx);
+        if (commaIdx === -1) break;
+        parts.push(rest.substring(currentIdx, commaIdx));
+        currentIdx = commaIdx + 1;
       }
+      parts.push(rest.substring(currentIdx));
 
-      if (!startStr || !endStr) continue;
+      const startIdx = formatColumns.indexOf('start') !== -1 ? formatColumns.indexOf('start') : 1;
+      const endIdx = formatColumns.indexOf('end') !== -1 ? formatColumns.indexOf('end') : 2;
+      const textIdx = formatColumns.indexOf('text') !== -1 ? formatColumns.indexOf('text') : parts.length - 1;
 
-      const text = rawText.replace(/\\N/g, '\n').replace(/\\n/g, '\n');
+      const rawStart = toEnglishDigits((parts[startIdx] || '0:00:00.00').trim());
+      const rawEnd = toEnglishDigits((parts[endIdx] || '0:00:05.00').trim());
+      const rawText = (parts[textIdx] || '').trim();
+      const normalizedText = rawText.replace(/\\N/g, '\n').replace(/\\n/g, '\n');
+      const stylePrefix = parts.slice(0, textIdx).join(',');
 
-      const rawStart = timestampToSeconds(startStr);
-      const rawEnd = timestampToSeconds(endStr);
-      const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
+      const parsedStartMs = parseTimestampToMs(rawStart) ?? 0;
+      const parsedEndMs = Math.max(parsedStartMs, parseTimestampToMs(rawEnd) ?? parsedStartMs);
 
       items.push({
-        id: autoId++,
-        startTime: startStr,
-        endTime: endStr,
-        startSeconds: startSec,
-        endSeconds: endSec,
-        originalText: text,
+        id: items.length + 1,
+        startTime: formatMsToASS(parsedStartMs),
+        endTime: formatMsToASS(parsedEndMs),
+        startSeconds: parsedStartMs / 1000,
+        endSeconds: parsedEndMs / 1000,
+        startMs: parsedStartMs,
+        endMs: parsedEndMs,
+        rawStartTime: rawStart,
+        rawEndTime: rawEnd,
+        originalText: normalizedText,
         translatedText: '',
-        styleTags: prefixParts.join(','),
+        styleTags: stylePrefix,
       });
-    } else {
+    } else if (!trimmed.startsWith('Comment:')) {
       headerLines.push(line);
     }
   }
 
   return {
     items,
-    format,
+    format: content.toLowerCase().includes('[v4 styles]') ? 'ssa' : 'ass',
     rawHeader: headerLines.join('\n'),
-    ...(warnings.length > 0 ? { warnings } : {}),
   };
 }
 
 /**
- * MicroDVD (.sub) Parser with header FPS auto-detection
+ * Parse MicroDVD (.sub) Format: {startFrame}{endFrame}Text
  */
-function parseSUB(content: string): { items: SubtitleItem[]; format: SubtitleFormat; subFps?: number } {
-  const lines = content.trim().split('\n');
-  const items: SubtitleItem[] = [];
-  let autoId = 1;
-  let detectedFps = 25;
+export function parseSUB(content: string, fps = 25): ParsedSubtitleResult {
+  const cleanContent = content
+    .replace(/^\uFEFF/, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
 
-  // Scan first 5 lines for {1}{1}23.976 or {1}{1}25.000 or {0}{0}25 FPS header
-  for (let i = 0; i < Math.min(lines.length, 5); i++) {
-    const headerMatch = lines[i].trim().match(/^\{[01]\}\{[01]\}([0-9.]+)/);
-    if (headerMatch) {
-      const parsedFps = parseFloat(headerMatch[1]);
-      if (isFinite(parsedFps) && parsedFps > 10 && parsedFps < 120) {
-        detectedFps = parsedFps;
-        break;
-      }
-    }
-  }
+  const lines = cleanContent.split('\n');
+  const items: SubtitleItem[] = [];
+  let effectiveFps = fps;
 
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
 
-    // Skip the FPS definition line itself if present
-    if (/^\{[01]\}\{[01]\}[0-9.]+$/.test(trimmed)) {
-      continue;
-    }
+    const match = trimmed.match(/^\{(\d+)\}\{(\d+)\}(.*)$/);
+    if (match) {
+      const startFrame = parseInt(match[1], 10);
+      const endFrame = parseInt(match[2], 10);
+      const rawText = match[3].trim();
 
-    const microDvdMatch = trimmed.match(/^\{(\d+)\}\{(\d+)\}(.*)/);
-    if (microDvdMatch) {
-      const startFrame = parseInt(microDvdMatch[1], 10);
-      const endFrame = parseInt(microDvdMatch[2], 10);
-      const rawStartSec = startFrame / detectedFps;
-      const rawEndSec = endFrame / detectedFps;
-      const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStartSec, rawEndSec);
-      const text = microDvdMatch[3].replace(/\|/g, '\n');
+      if (startFrame === 1 && endFrame === 1 && /^\d+(?:\.\d+)?$/.test(rawText)) {
+        const headerFps = parseFloat(rawText);
+        if (headerFps > 0 && headerFps < 200) {
+          effectiveFps = headerFps;
+        }
+        continue;
+      }
+
+      const startMs = Math.max(0, Math.round((startFrame / effectiveFps) * 1000));
+      const endMs = Math.max(startMs, Math.round((endFrame / effectiveFps) * 1000));
+      const normalizedText = rawText.replace(/\|/g, '\n');
 
       items.push({
-        id: autoId++,
-        startTime: secondsToSRT(startSec),
-        endTime: secondsToSRT(endSec),
-        startSeconds: startSec,
-        endSeconds: endSec,
-        originalText: text,
+        id: items.length + 1,
+        startTime: formatMsToSRT(startMs),
+        endTime: formatMsToSRT(endMs),
+        startSeconds: startMs / 1000,
+        endSeconds: endMs / 1000,
+        startMs,
+        endMs,
+        rawStartTime: formatMsToSRT(startMs),
+        rawEndTime: formatMsToSRT(endMs),
+        originalText: normalizedText,
         translatedText: '',
       });
-      continue;
-    }
-
-    if (trimmed.includes('-->') || trimmed.includes(',')) {
-      const parts = trimmed.split(/-->|,/).map((s) => s.trim());
-      if (parts.length >= 2 && parts[0].includes(':')) {
-        const rawStart = timestampToSeconds(parts[0]);
-        const rawEnd = timestampToSeconds(parts[1]);
-        const { start: startSec, end: endSec } = validateAndSanitizeTimecodes(rawStart, rawEnd);
-        items.push({
-          id: autoId++,
-          startTime: parts[0],
-          endTime: parts[1],
-          startSeconds: startSec,
-          endSeconds: endSec,
-          originalText: '',
-          translatedText: '',
-        });
-      }
     }
   }
 
-  // FIX (L8): expose the detected FPS so the export re-encodes with the SAME frame rate
-  return { items, format: 'sub', subFps: detectedFps };
-}
-
-export const RTL_LANGUAGES = ['fa', 'ar', 'he', 'ur', 'ps'];
-
-/**
- * Ensures proper rendering of RTL punctuation in media players
- */
-export function fixRTLPunctuation(text: string): string {
-  if (!text) return text;
-  return text
-    .split('\n')
-    .map((line) => {
-      const trimmed = line.trim();
-      if (!trimmed) return line;
-      if (trimmed.endsWith('\u200F')) return trimmed;
-      return `${trimmed}\u200F`;
-    })
-    .join('\n');
+  return {
+    items,
+    format: 'sub',
+    subFps: effectiveFps,
+  };
 }
 
 /**
- * Export subtitles to requested format
- * FIX (L8): `subFps` lets MicroDVD exports keep the frame rate detected at parse time
- * instead of silently re-timing everything at 25fps.
- * FIX (B17): when appendRTLMarkers is false, any RTL markers that were already merged into
- * the text are stripped so the toggle is a true guarantee, not a suggestion.
+ * Master Auto-Detecting Subtitle Parser (Content-Signature First)
  */
-export function exportSubtitleFile(
-  items: SubtitleItem[],
-  targetFormat: SubtitleFormat,
-  rawHeader?: string,
-  isRTL?: boolean,
-  appendRTLMarkers = true,
-  subFps = 25
-): string {
-  const processedItems = items.map((item) => {
-    const rawText = item.translatedText.trim() || item.originalText.trim();
-    const containsRTL = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF\uFB50-\uFDFF\uFE70-\uFEFF]/.test(rawText);
-    const applyRTLFix = appendRTLMarkers && (isRTL !== undefined ? isRTL : containsRTL);
-    // FIX (B17): strip pre-existing hidden RTL marks when the option is OFF
-    const markerFreeText = appendRTLMarkers ? rawText : rawText.replace(/\u200F/g, '');
-    const textWithFix = applyRTLFix ? fixRTLPunctuation(markerFreeText) : markerFreeText;
-
-    if (item.translatedText.trim()) {
-      return { ...item, translatedText: textWithFix };
-    }
-    return { ...item, originalText: textWithFix };
-  });
-
-  switch (targetFormat) {
+export function parseSubtitleFile(content: string, fileName: string): ParsedSubtitleResult {
+  const format = detectFormat(content, fileName);
+  switch (format) {
     case 'vtt':
-      return exportVTT(processedItems, rawHeader);
+      return parseVTT(content);
     case 'ass':
     case 'ssa':
-      return exportASS(processedItems, targetFormat, rawHeader);
+      return parseASS(content);
     case 'sub':
-      return exportSUB(processedItems, subFps);
+      return parseSUB(content);
     case 'srt':
     default:
-      return exportSRT(processedItems);
+      return parseSRT(content);
   }
 }
 
+// ============================================================================
+// LOSSLESS SOURCE-TEMPLATE SPLICER + ZERO-DRIFT SYNTHETIC EXPORTERS
+// ============================================================================
+
 /**
- * Sanitize cue payload for SRT/VTT so internal blank lines or "-->" never break cue boundaries in players.
+ * Attempts 100% lossless source-template splicing for same-format SRT/VTT exports.
+ * Replaces ONLY the cue text payload spans while leaving EVERY byte of headers,
+ * X-TIMESTAMP-MAP, STYLE, REGION, NOTE blocks, cue IDs, exact timestamp strings,
+ * cue settings, and blank lines 100.000% identical to the original English file.
+ *
+ * Returns null safely if timestamps were manually shifted/edited, rows were added/removed,
+ * or source template metadata is absent — in which case the pure integer-ms exporter runs.
  */
-function sanitizeCuePayloadText(raw: string): string {
-  return (raw || '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .replace(/\n[ \t]*\n+/g, '\n')
-    .replace(/-->/g, '->')
-    .trim();
+function tryLosslessTemplateSplice(
+  items: SubtitleItem[],
+  targetFormat: 'srt' | 'vtt',
+  isRTL: boolean,
+  appendRTLMarkers: boolean,
+  sourceMeta?: SourceTemplateExportMeta
+): string | null {
+  if (
+    !sourceMeta ||
+    sourceMeta.sourceFormat !== targetFormat ||
+    typeof sourceMeta.rawSourceText !== 'string' ||
+    sourceMeta.rawSourceText.length === 0 ||
+    !Array.isArray(sourceMeta.sourceCueSpans) ||
+    sourceMeta.sourceCueSpans.length === 0 ||
+    sourceMeta.sourceCueSpans.length !== items.length
+  ) {
+    return null;
+  }
+
+  const raw = sourceMeta.rawSourceText;
+  const spans = sourceMeta.sourceCueSpans;
+
+  // For WebVTT, verify the raw template starts cleanly with WEBVTT (so stream players accept it)
+  if (targetFormat === 'vtt' && !/^WEBVTT(?:\s|$)/i.test(raw.trimStart())) {
+    return null;
+  }
+
+  // Verify every single item's resolved timing matches its source span with 0ms difference
+  // and spans are strictly non-overlapping and within bounds
+  let prevEnd = -1;
+  for (let i = 0; i < items.length; i++) {
+    const span = spans[i];
+    if (
+      !span ||
+      span.textStart < 0 ||
+      span.textEnd < span.textStart ||
+      span.textEnd > raw.length ||
+      span.textStart < prevEnd
+    ) {
+      return null;
+    }
+    prevEnd = span.textEnd;
+
+    const currentTiming = resolveItemTimingMs(items[i]);
+    if (currentTiming.startMs !== span.startMs || currentTiming.endMs !== span.endMs) {
+      // User manually edited or time-shifted timestamps — fall back to pure-integer exporter
+      return null;
+    }
+  }
+
+  // Splice cue payloads from back to front so earlier character offsets never shift
+  let result = raw;
+  for (let i = items.length - 1; i >= 0; i--) {
+    const span = spans[i];
+    const item = items[i];
+    const rawText = (item.translatedText && item.translatedText.trim().length > 0)
+      ? item.translatedText
+      : item.originalText;
+    const sanitized = sanitizeCuePayloadText(rawText, isRTL, appendRTLMarkers);
+
+    if (span.textStart === span.textEnd) {
+      // Cue originally had empty payload: insert newline + payload if non-empty
+      if (sanitized.length > 0) {
+        result = result.slice(0, span.textStart) + '\n' + sanitized + result.slice(span.textEnd);
+      }
+    } else {
+      // Preserve cue even if sanitized somehow came out empty by keeping a zero-width safe fallback
+      const replacement = sanitized.length > 0 ? sanitized : raw.slice(span.textStart, span.textEnd);
+      result = result.slice(0, span.textStart) + replacement + result.slice(span.textEnd);
+    }
+  }
+
+  // Ensure clean UTF-8 without BOM and trailing newline
+  const cleanResult = result.replace(/^\uFEFF/, '');
+  const finalOutput = cleanResult.endsWith('\n') ? cleanResult : `${cleanResult}\n`;
+
+  // Final round-trip self-audit: guarantee 0ms drift and exact 1:1 cue count before returning!
+  const check = verifySubtitleTimingIntegrity(items, finalOutput, targetFormat);
+  if (!check.valid) {
+    return null;
+  }
+
+  return finalOutput;
 }
 
-function exportSRT(items: SubtitleItem[]): string {
-  return items
-    .map((item, index) => {
-      const text = sanitizeCuePayloadText(item.translatedText.trim() || item.originalText.trim());
-      const start = toEnglishDigits(normalizeTimestampToSRT(item.startTime, item.startSeconds));
-      const end = toEnglishDigits(normalizeTimestampToSRT(item.endTime, item.endSeconds));
-      return `${index + 1}\n${start} --> ${end}\n${text}\n`;
-    })
-    .join('\n');
+/**
+ * Export SubtitleItem[] to standard SRT format with 100% exact ASCII timestamps (0ms drift).
+ */
+export function exportSRT(
+  items: SubtitleItem[],
+  isRTL = false,
+  appendRTLMarkers = false,
+  sourceMeta?: SourceTemplateExportMeta
+): string {
+  if (!items || items.length === 0) return '';
+
+  const spliced = tryLosslessTemplateSplice(items, 'srt', isRTL, appendRTLMarkers, sourceMeta);
+  if (spliced !== null) return spliced;
+
+  const blocks = items.map((item, idx) => {
+    const { startMs, endMs } = resolveItemTimingMs(item);
+    const startStr = formatMsToSRT(startMs);
+    const endStr = formatMsToSRT(endMs);
+
+    const rawText = (item.translatedText && item.translatedText.trim().length > 0)
+      ? item.translatedText
+      : item.originalText;
+    const text = sanitizeCuePayloadText(rawText, isRTL, appendRTLMarkers);
+
+    return `${idx + 1}\n${startStr} --> ${endStr}\n${text}`;
+  });
+
+  return `${blocks.join('\n\n')}\n`;
 }
 
-function isValidVttCueSettings(raw?: string): boolean {
-  if (!raw || !raw.trim()) return false;
-  const tokens = raw.trim().split(/\s+/);
-  return tokens.every((tok) => /^(vertical|line|position|size|align|region):[^\s]+$/i.test(tok));
+/**
+ * Export SubtitleItem[] to W3C Spec-Compliant & Video-Stream-Ready WebVTT format:
+ * - Uses 100% lossless source-template splicing when source is WebVTT and timings are unmodified
+ * - Clean UTF-8 (NO BOM — first 6 bytes are strictly "WEBVTT")
+ * - Preserves source VTT header metadata including X-TIMESTAMP-MAP, STYLE, REGION, Kind, Language
+ * - Uses 100% exact integer-ms ASCII HH:MM:SS.mmm timestamps (0ms drift!)
+ * - Preserves valid W3C cue settings (align, line, position, size, vertical, region)
+ * - Sanitizes cue payloads so blank lines or "-->" never break video stream parsing
+ */
+export function exportVTT(
+  items: SubtitleItem[],
+  isRTL = false,
+  rawHeader?: string,
+  appendRTLMarkers = false,
+  sourceMeta?: SourceTemplateExportMeta
+): string {
+  if (items && items.length > 0) {
+    const spliced = tryLosslessTemplateSplice(items, 'vtt', isRTL, appendRTLMarkers, sourceMeta);
+    if (spliced !== null) return spliced;
+  }
+
+  // Build clean W3C WebVTT header
+  let header = 'WEBVTT';
+  if (rawHeader && typeof rawHeader === 'string') {
+    const cleanHeader = rawHeader
+      .replace(/^\uFEFF/, '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .trim();
+    if (/^WEBVTT(?:\s|$)/i.test(cleanHeader)) {
+      header = cleanHeader;
+    }
+  }
+
+  if (!items || items.length === 0) {
+    return `${header}\n\n`;
+  }
+
+  const blocks = items.map((item) => {
+    const { startMs, endMs } = resolveItemTimingMs(item);
+    const startStr = formatMsToVTT(startMs);
+    const endStr = formatMsToVTT(endMs);
+
+    const settings = extractValidVttCueSettings(item.cueSettings || item.styleTags);
+    const timingLine = settings
+      ? `${startStr} --> ${endStr} ${settings}`
+      : `${startStr} --> ${endStr}`;
+
+    const rawText = (item.translatedText && item.translatedText.trim().length > 0)
+      ? item.translatedText
+      : item.originalText;
+    const text = sanitizeCuePayloadText(rawText, isRTL, appendRTLMarkers);
+
+    const safeCueId =
+      item.cueId &&
+      item.cueId.trim().length > 0 &&
+      !item.cueId.includes('-->') &&
+      !item.cueId.includes('\n') &&
+      !item.cueId.includes('\r')
+        ? item.cueId.trim()
+        : '';
+
+    const lines: string[] = [];
+    if (safeCueId) lines.push(safeCueId);
+    lines.push(timingLine);
+    if (text.length > 0) lines.push(text);
+
+    return lines.join('\n');
+  });
+
+  return `${header}\n\n${blocks.join('\n\n')}\n`;
 }
 
-function exportVTT(items: SubtitleItem[], rawHeader?: string): string {
-  const cleanedHeader = rawHeader && rawHeader.startsWith('WEBVTT')
-    ? rawHeader
-        .split('\n')
-        .filter((l) => !/^X-TIMESTAMP-MAP=/i.test(l.trim()))
-        .join('\n')
-        .trim()
-    : 'WEBVTT';
-  const header = cleanedHeader.startsWith('WEBVTT') ? cleanedHeader : 'WEBVTT';
-  const body = items
-    .map((item) => {
-      const text = sanitizeCuePayloadText(item.translatedText.trim() || item.originalText.trim());
-      const start = toEnglishDigits(normalizeTimestampToVTT(item.startTime, item.startSeconds));
-      const end = toEnglishDigits(normalizeTimestampToVTT(item.endTime, item.endSeconds));
-      const settingsStr = isValidVttCueSettings(item.styleTags) ? ` ${item.styleTags!.trim()}` : '';
-      // FIX (L9): restore the cue identifier when the source file had one (ASCII-safe, never containing -->)
-      const safeCueId = item.cueId && !item.cueId.includes('-->') ? toEnglishDigits(item.cueId).trim() : '';
-      const idStr = safeCueId ? `${safeCueId}\n` : '';
-      return `${idStr}${start} --> ${end}${settingsStr}\n${text}\n`;
-    })
-    .join('\n');
-
-  return `${header}\n\n${body}`;
-}
-
-function exportASS(items: SubtitleItem[], _format: SubtitleFormat, rawHeader?: string): string {
-  const header =
-    rawHeader ||
-    `[Script Info]
-Title: Translated Subtitles
+/**
+ * Export SubtitleItem[] to ASS / SSA format
+ */
+export function exportASS(
+  items: SubtitleItem[],
+  rawHeader?: string,
+  isRTL = false,
+  appendRTLMarkers = false
+): string {
+  const defaultHeader = `[Script Info]
+Title: SubGame Lab Translated Subtitles
 ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
@@ -935,43 +1189,328 @@ Style: Default,Vazirmatn,22,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text`;
 
+  const hasAssHeader = Boolean(rawHeader && /\[Script Info\]/i.test(rawHeader));
+  const header = hasAssHeader ? rawHeader!.trim() : defaultHeader;
+
   const eventLines = items
     .map((item) => {
-      const start = normalizeTimestampToASS(item.startTime, item.startSeconds);
-      const end = normalizeTimestampToASS(item.endTime, item.endSeconds);
-      const cleanText = (item.translatedText.trim() || item.originalText.trim()).replace(/\n/g, '\\N');
+      const { startMs, endMs } = resolveItemTimingMs(item);
+      const startStr = formatMsToASS(startMs);
+      const endStr = formatMsToASS(endMs);
+
+      const rawText = (item.translatedText && item.translatedText.trim().length > 0)
+        ? item.translatedText
+        : item.originalText;
+      const sanitized = sanitizeCuePayloadText(rawText, isRTL, appendRTLMarkers);
+      const assText = sanitized.replace(/\n/g, '\\N');
+
       let prefix = item.styleTags;
-      if (prefix) {
+      if (prefix && !/^(?:vertical|line|position|size|align|region):/i.test(prefix.trim())) {
         const parts = prefix.split(',');
-        if (parts.length >= 3) {
-          parts[1] = start;
-          parts[2] = end;
+        if (parts.length >= 9) {
+          parts[1] = startStr;
+          parts[2] = endStr;
           prefix = parts.join(',');
         } else {
-          prefix = `0,${start},${end},Default,,0,0,0,`;
+          prefix = `0,${startStr},${endStr},Default,,0,0,0,`;
         }
       } else {
-        prefix = `0,${start},${end},Default,,0,0,0,`;
+        prefix = `0,${startStr},${endStr},Default,,0,0,0,`;
       }
-      return `Dialogue: ${prefix},${cleanText}`;
+
+      return `Dialogue: ${prefix},${assText}`;
     })
     .join('\n');
 
   return `${header}\n${eventLines}\n`;
 }
 
-function exportSUB(items: SubtitleItem[], fps = 25): string {
-  // FIX (L8): use the FPS detected from the source header (fallback 25) so the
-  // frame-based timing in the output matches the original playback speed.
-  const safeFps = isFinite(fps) && fps > 10 && fps < 120 ? fps : 25;
-  const header = `{1}{1}${safeFps}\n`;
-  const body = items
-    .map((item) => {
-      const startFrame = secondsToFrame(item.startSeconds, safeFps);
-      const endFrame = secondsToFrame(item.endSeconds, safeFps);
-      const text = (item.translatedText.trim() || item.originalText.trim()).replace(/\n/g, '|');
-      return `{${startFrame}}{${endFrame}}${text}`;
-    })
-    .join('\n');
-  return `${header}${body}`;
+/**
+ * Export SubtitleItem[] to MicroDVD (.sub) format
+ */
+export function exportSUB(
+  items: SubtitleItem[],
+  fps = 25,
+  isRTL = false,
+  appendRTLMarkers = false
+): string {
+  const safeFps = fps > 0 && fps < 200 ? fps : 25;
+  return (
+    items
+      .map((item) => {
+        const { startMs, endMs } = resolveItemTimingMs(item);
+        const startFrame = Math.max(0, Math.round((startMs / 1000) * safeFps));
+        const endFrame = Math.max(startFrame + 1, Math.round((endMs / 1000) * safeFps));
+        const rawText = (item.translatedText && item.translatedText.trim().length > 0)
+          ? item.translatedText
+          : item.originalText;
+        const text = sanitizeCuePayloadText(rawText, isRTL, appendRTLMarkers).replace(/\n/g, '|');
+        return `{${startFrame}}{${endFrame}}${text}`;
+      })
+      .join('\n') + '\n'
+  );
+}
+
+/**
+ * Master Subtitle Exporter
+ */
+export function exportSubtitleFile(
+  items: SubtitleItem[],
+  targetFormat: SubtitleFormat,
+  rawHeader?: string,
+  isRTL = false,
+  appendRTLMarkers = false,
+  fps = 25,
+  sourceMeta?: SourceTemplateExportMeta
+): string {
+  switch (targetFormat) {
+    case 'vtt':
+      return exportVTT(items, isRTL, rawHeader, appendRTLMarkers, sourceMeta);
+    case 'ass':
+    case 'ssa':
+      return exportASS(items, rawHeader, isRTL, appendRTLMarkers);
+    case 'sub':
+      return exportSUB(items, fps, isRTL, appendRTLMarkers);
+    case 'srt':
+    default:
+      return exportSRT(items, isRTL, appendRTLMarkers, sourceMeta);
+  }
+}
+
+// ============================================================================
+// BUILT-IN TIMING INTEGRITY VERIFIER & ORIGINAL-SOURCE RE-SYNC ENGINE
+// ============================================================================
+
+export interface TimingIntegrityReport {
+  valid: boolean;
+  totalCues: number;
+  exportedCues: number;
+  matchedCues: number;
+  maxDriftMs: number;
+  mismatchedIndices: number[];
+  error?: string;
+}
+
+/**
+ * Re-parses the generated SRT or VTT export string and verifies:
+ *  1) Exact 1:1 cue count equality
+ *  2) 0ms drift on BOTH start and end timestamps for EVERY SINGLE cue
+ */
+export function verifySubtitleTimingIntegrity(
+  sourceItems: SubtitleItem[],
+  exportedContent: string,
+  targetFormat: 'srt' | 'vtt'
+): TimingIntegrityReport {
+  const reparsed = targetFormat === 'vtt'
+    ? parseVTT(exportedContent)
+    : parseSRT(exportedContent);
+
+  const totalCues = sourceItems.length;
+  const exportedCues = reparsed.items.length;
+  const mismatchedIndices: number[] = [];
+  let maxDriftMs = 0;
+  let matchedCues = 0;
+
+  const compareCount = Math.min(totalCues, exportedCues);
+  for (let i = 0; i < compareCount; i++) {
+    const src = resolveItemTimingMs(sourceItems[i]);
+    const exp = resolveItemTimingMs(reparsed.items[i]);
+    const driftStart = Math.abs(exp.startMs - src.startMs);
+    const driftEnd = Math.abs(exp.endMs - src.endMs);
+    const cueDrift = Math.max(driftStart, driftEnd);
+    if (cueDrift > maxDriftMs) maxDriftMs = cueDrift;
+
+    if (cueDrift === 0) {
+      matchedCues++;
+    } else {
+      mismatchedIndices.push(i + 1);
+    }
+  }
+
+  const valid = totalCues === exportedCues && mismatchedIndices.length === 0 && maxDriftMs === 0;
+  return {
+    valid,
+    totalCues,
+    exportedCues,
+    matchedCues,
+    maxDriftMs,
+    mismatchedIndices,
+    error: valid
+      ? undefined
+      : totalCues !== exportedCues
+        ? `Cue count mismatch: expected ${totalCues}, exported ${exportedCues}`
+        : `Timing drift detected (max ${maxDriftMs}ms) at cues: ${mismatchedIndices.slice(0, 5).join(', ')}`,
+  };
+}
+
+export interface TimingResyncReport {
+  items: SubtitleItem[];
+  matchedCount: number;
+  adjustedCount: number;
+  maxFixedDriftMs: number;
+  unmatchedCount: number;
+}
+
+export interface FullSourceResyncReport extends TimingResyncReport {
+  sourceFormat: SubtitleFormat;
+  rawHeader?: string;
+  rawSourceText?: string;
+  sourceCueSpans?: SubtitleCueSpan[];
+  countMismatch: boolean;
+  originalCount: number;
+  existingCount: number;
+  hasXTimestampMap?: boolean;
+}
+
+function normalizeTextForAnchorMatch(text: string): string {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\{\\[^}]+\}/g, ' ')
+    .replace(/[\r\n\t]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Re-locks 100% exact timestamps, cueSettings, and cueIds from an original English
+ * reference subtitle file onto an already-translated SubtitleItem[] without losing
+ * any translated Persian text (0 AI tokens!).
+ */
+export function resyncItemsFromReferenceSubtitles(
+  existingItems: SubtitleItem[],
+  referenceItems: SubtitleItem[]
+): TimingResyncReport {
+  if (existingItems.length === 0 || referenceItems.length === 0) {
+    return {
+      items: existingItems,
+      matchedCount: 0,
+      adjustedCount: 0,
+      maxFixedDriftMs: 0,
+      unmatchedCount: existingItems.length,
+    };
+  }
+
+  let matchedCount = 0;
+  let adjustedCount = 0;
+  let maxFixedDriftMs = 0;
+  let unmatchedCount = 0;
+
+  // Fast exact 1:1 path when cue counts match
+  if (existingItems.length === referenceItems.length) {
+    const synced = existingItems.map((item, idx) => {
+      const ref = referenceItems[idx];
+      const oldTiming = resolveItemTimingMs(item);
+      const refTiming = resolveItemTimingMs(ref);
+      const drift = Math.max(
+        Math.abs(oldTiming.startMs - refTiming.startMs),
+        Math.abs(oldTiming.endMs - refTiming.endMs)
+      );
+      if (drift > 0) {
+        adjustedCount++;
+        if (drift > maxFixedDriftMs) maxFixedDriftMs = drift;
+      }
+      matchedCount++;
+      return {
+        ...item,
+        startTime: ref.startTime,
+        endTime: ref.endTime,
+        startSeconds: ref.startSeconds,
+        endSeconds: ref.endSeconds,
+        startMs: ref.startMs,
+        endMs: ref.endMs,
+        rawStartTime: ref.rawStartTime,
+        rawEndTime: ref.rawEndTime,
+        cueSettings: ref.cueSettings,
+        cueId: ref.cueId,
+      };
+    });
+
+    return {
+      items: synced,
+      matchedCount,
+      adjustedCount,
+      maxFixedDriftMs,
+      unmatchedCount: 0,
+    };
+  }
+
+  // Fallback anchor-matching path when old parser had an orphan cue or split cue
+  const existingQueueByText = new Map<string, SubtitleItem[]>();
+  existingItems.forEach((ex) => {
+    const key = normalizeTextForAnchorMatch(ex.originalText);
+    if (!key) return;
+    const list = existingQueueByText.get(key) || [];
+    list.push(ex);
+    existingQueueByText.set(key, list);
+  });
+
+  const rebuilt: SubtitleItem[] = referenceItems.map((ref, idx) => {
+    const key = normalizeTextForAnchorMatch(ref.originalText);
+    const candidates = key ? existingQueueByText.get(key) : undefined;
+    const matchedExisting = candidates && candidates.length > 0
+      ? candidates.shift()!
+      : existingItems[idx];
+
+    if (matchedExisting) {
+      const oldTiming = resolveItemTimingMs(matchedExisting);
+      const refTiming = resolveItemTimingMs(ref);
+      const drift = Math.max(
+        Math.abs(oldTiming.startMs - refTiming.startMs),
+        Math.abs(oldTiming.endMs - refTiming.endMs)
+      );
+      if (drift > 0) {
+        adjustedCount++;
+        if (drift > maxFixedDriftMs) maxFixedDriftMs = drift;
+      }
+      matchedCount++;
+      return {
+        ...ref,
+        id: idx + 1,
+        translatedText: matchedExisting.translatedText || '',
+      };
+    }
+
+    unmatchedCount++;
+    return {
+      ...ref,
+      id: idx + 1,
+    };
+  });
+
+  return {
+    items: rebuilt,
+    matchedCount,
+    adjustedCount,
+    maxFixedDriftMs,
+    unmatchedCount,
+  };
+}
+
+/**
+ * Full zero-token re-sync from an original English subtitle file's raw text:
+ * - Re-parses the authoritative original English file (capturing rawHeader, X-TIMESTAMP-MAP,
+ *   rawSourceText, and exact sourceCueSpans)
+ * - Re-locks every single cue timestamp onto the already-translated items
+ * - Enables 100% lossless template-spliced export on existing translated folders!
+ */
+export function resyncFileFromOriginalSource(
+  existingItems: SubtitleItem[],
+  originalRawText: string,
+  originalFileName: string
+): FullSourceResyncReport {
+  const parsed = parseSubtitleFile(originalRawText, originalFileName);
+  const resync = resyncItemsFromReferenceSubtitles(existingItems, parsed.items);
+
+  return {
+    ...resync,
+    sourceFormat: parsed.format,
+    rawHeader: parsed.rawHeader,
+    rawSourceText: parsed.rawSourceText,
+    sourceCueSpans: parsed.sourceCueSpans,
+    countMismatch: existingItems.length !== parsed.items.length,
+    originalCount: parsed.items.length,
+    existingCount: existingItems.length,
+    hasXTimestampMap: parsed.hasXTimestampMap,
+  };
 }

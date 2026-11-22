@@ -15,7 +15,8 @@ import {
   CustomProviderConfig,
   ModeSessionState,
   SubtitleFolder,
-  SubtitleFolderFile
+  SubtitleFolderFile,
+  SubtitleCueSpan
 } from './types';
 import { 
   createDefaultSession, 
@@ -38,6 +39,8 @@ import {
   timestampToSeconds,
   secondsToSRT,
   toEnglishDigits,
+  verifySubtitleTimingIntegrity,
+  resyncFileFromOriginalSource,
   RTL_LANGUAGES
 } from './lib/subtitleParser';
 import {
@@ -45,6 +48,10 @@ import {
   getFileCompletionStats,
   getFolderCompletionStats,
 } from './lib/translationCompleteness';
+import {
+  upgradeFileWithNewTimingEngine,
+  upgradeFolderWithNewTimingEngine,
+} from './lib/timingUpgradeEngine';
 import { createZipBlob } from './lib/zipHelper';
 import { 
   parseGameLocalizationFile,
@@ -189,6 +196,8 @@ export default function App() {
   const [fileSize, setFileSize] = useState<number>(0);
   const [sourceFormat, setSourceFormat] = useState<SubtitleFormat | GameFormat>('srt');
   const [rawHeader, setRawHeader] = useState<string | undefined>(undefined);
+  const rawSourceTextRef = useRef<string | undefined>(undefined);
+  const sourceCueSpansRef = useRef<SubtitleCueSpan[] | undefined>(undefined);
   const [selectedEncoding, setSelectedEncoding] = useState<string>('auto');
   const [detectedEncoding, setDetectedEncoding] = useState<string>('');
   const [items, setItems] = useState<SubtitleItem[]>([]);
@@ -460,6 +469,8 @@ export default function App() {
     setSourceFormat(s.sourceFormat);
     setTargetFormat(s.targetFormat);
     setRawHeader(s.rawHeader);
+    rawSourceTextRef.current = s.rawSourceText;
+    sourceCueSpansRef.current = s.sourceCueSpans;
     setSelectedEncoding(s.selectedEncoding || 'auto');
     setDetectedEncoding(s.detectedEncoding || '');
     setItems(s.items || []);
@@ -490,6 +501,8 @@ export default function App() {
       sourceFormat,
       targetFormat,
       rawHeader,
+      rawSourceText: rawSourceTextRef.current,
+      sourceCueSpans: sourceCueSpansRef.current,
       selectedEncoding,
       detectedEncoding,
       items,
@@ -589,6 +602,8 @@ export default function App() {
           fileSize: savedCinema.fileSize || 0,
           sourceFormat: (savedCinema.sourceFormat as SubtitleFormat) || 'srt',
           rawHeader: savedCinema.rawHeader,
+          rawSourceText: savedCinema.rawSourceText,
+          sourceCueSpans: savedCinema.sourceCueSpans,
           detectedEncoding: savedCinema.detectedEncoding || 'UTF-8',
           items: savedCinema.items,
           status: savedCinema.items.every((it) => it.translatedText?.trim()) ? 'done' : 'pending',
@@ -645,6 +660,8 @@ export default function App() {
           setSourceFormat(file.sourceFormat);
           setTargetFormat(file.sourceFormat);
           setRawHeader(file.rawHeader);
+          rawSourceTextRef.current = file.rawSourceText;
+          sourceCueSpansRef.current = file.sourceCueSpans;
           setDetectedEncoding(file.detectedEncoding);
           subFpsRef.current = file.subFps || 25;
           setItems(file.items);
@@ -703,6 +720,8 @@ export default function App() {
       sourceFormat,
       targetFormat,
       rawHeader,
+      rawSourceText: rawSourceTextRef.current,
+      sourceCueSpans: sourceCueSpansRef.current,
       selectedEncoding,
       detectedEncoding,
       items,
@@ -829,6 +848,8 @@ export default function App() {
         setSourceFormat(parsed.format);
         setTargetFormat(parsed.format);
         setRawHeader(parsed.rawHeader);
+        rawSourceTextRef.current = parsed.rawSourceText;
+        sourceCueSpansRef.current = parsed.sourceCueSpans;
         // FIX (L8): remember the MicroDVD FPS detected in the source header for export
         subFpsRef.current = (parsed as any).subFps || 25;
 
@@ -1962,14 +1983,34 @@ export default function App() {
       );
       fileSuffix = `bilingual_${targetLanguage}`;
     } else {
+      const activeFolderObj = foldersRef.current.find((f) => f.id === activeFolderIdRef.current);
+      const activeFileObj = activeFolderObj?.files.find((fl) => fl.id === activeFileIdRef.current);
       exportedContent = exportSubtitleFile(
         items,
         targetFormat as SubtitleFormat,
         rawHeader,
         isRTL,
         appendRTLMarkers, // FIX (B17): the cinema UI toggle now reaches the exporter too
-        subFpsRef.current // FIX (L8): keep the MicroDVD frame rate of the source file
+        subFpsRef.current, // FIX (L8): keep the MicroDVD frame rate of the source file
+        {
+          rawSourceText: activeFileObj?.rawSourceText ?? rawSourceTextRef.current,
+          sourceFormat: (activeFileObj?.sourceFormat ?? sourceFormat) as SubtitleFormat,
+          sourceCueSpans: activeFileObj?.sourceCueSpans ?? sourceCueSpansRef.current,
+        }
       );
+
+      if (targetFormat === 'vtt' || targetFormat === 'srt') {
+        const report = verifySubtitleTimingIntegrity(items, exportedContent, targetFormat);
+        if (!report.valid) {
+          console.error('[Timing Audit Warning]', fileName, report);
+          showToast(
+            uiLang === 'en'
+              ? `Timing integrity warning: ${report.error}`
+              : `هشدار کنترل تایم‌بندی: ${report.error}`,
+            'warning'
+          );
+        }
+      }
     }
 
     const blob = new Blob([exportedContent], { type: 'text/plain;charset=utf-8' });
@@ -2041,6 +2082,8 @@ export default function App() {
       setSourceFormat('srt');
       setTargetFormat('srt');
       setRawHeader(undefined);
+      rawSourceTextRef.current = undefined;
+      sourceCueSpansRef.current = undefined;
       setDetectedEncoding('');
       subFpsRef.current = 25;
       setItems([]);
@@ -2051,6 +2094,8 @@ export default function App() {
     setSourceFormat(file.sourceFormat);
     setTargetFormat(file.sourceFormat);
     setRawHeader(file.rawHeader);
+    rawSourceTextRef.current = file.rawSourceText;
+    sourceCueSpansRef.current = file.sourceCueSpans;
     setDetectedEncoding(file.detectedEncoding || 'UTF-8');
     subFpsRef.current = file.subFps || 25;
     setItems(file.items);
@@ -2165,6 +2210,8 @@ export default function App() {
           fileSize: file.size,
           sourceFormat: parsed.format,
           rawHeader: parsed.rawHeader,
+          rawSourceText: parsed.rawSourceText,
+          sourceCueSpans: parsed.sourceCueSpans,
           detectedEncoding: encoding,
           subFps: parsed.subFps || 25,
           items: parsed.items,
@@ -2275,6 +2322,8 @@ export default function App() {
       fileSize: new TextEncoder().encode(SAMPLE_SRT_CONTENT).byteLength,
       sourceFormat: 'srt',
       rawHeader: parsed.rawHeader,
+      rawSourceText: parsed.rawSourceText,
+      sourceCueSpans: parsed.sourceCueSpans,
       detectedEncoding: 'UTF-8',
       subFps: 25,
       items: parsed.items,
@@ -3107,7 +3156,17 @@ export default function App() {
     }
 
     const isRTL = RTL_LANGUAGES.includes(targetLanguage);
-    const entries = completedFiles.map((file) => {
+    let timingMismatchFiles = 0;
+    const upgradedMap = new Map<string, SubtitleFolderFile>();
+
+    const entries = completedFiles.map((rawFile) => {
+      // Automatically upgrade legacy file with the new zero-drift timing engine before export (0 tokens!)
+      const upgradedReport = upgradeFileWithNewTimingEngine(rawFile, targetLanguage, appendRTLMarkers);
+      const file = upgradedReport.file;
+      if (upgradedReport.changed) {
+        upgradedMap.set(file.id, file);
+      }
+
       const baseName = file.fileName.replace(/\.[^/.]+$/, '') || file.fileName;
       const content = bilingualConfig?.enabled
         ? exportBilingualSubtitleFile(file.items, format, bilingualConfig, file.rawHeader, isRTL)
@@ -3117,13 +3176,47 @@ export default function App() {
             file.rawHeader,
             isRTL,
             appendRTLMarkers,
-            file.subFps || 25
+            file.subFps || 25,
+            {
+              rawSourceText: file.rawSourceText,
+              sourceFormat: file.sourceFormat,
+              sourceCueSpans: file.sourceCueSpans,
+            }
           );
+
+      if (!bilingualConfig?.enabled) {
+        const audit = verifySubtitleTimingIntegrity(file.items, content, format);
+        if (!audit.valid) {
+          timingMismatchFiles++;
+          console.error('[Batch Export Timing Audit Warning]', file.fileName, audit);
+        }
+      }
+
       return {
         name: `${baseName}.${format}`,
         content,
       };
     });
+
+    if (upgradedMap.size > 0) {
+      const persistedFolder: SubtitleFolder = {
+        ...folder,
+        updatedAt: Date.now(),
+        files: folder.files.map((fl) => upgradedMap.get(fl.id) || fl),
+      };
+      foldersRef.current = foldersRef.current.map((f) => (f.id === folder.id ? persistedFolder : f));
+      setFolders(foldersRef.current);
+      void saveFolderToDb(persistedFolder);
+    }
+
+    if (timingMismatchFiles > 0) {
+      showToast(
+        uiLang === 'en'
+          ? `Timing warning detected on ${timingMismatchFiles} file(s). Please re-sync with original English files.`
+          : `هشدار تایم‌بندی در ${timingMismatchFiles} فایل شناسایی شد. لطفاً از دکمه «همگام‌سازی تایم‌بندی» استفاده کنید.`,
+        'warning'
+      );
+    }
 
     if (entries.length === 1) {
       const blob = new Blob([entries[0].content], { type: 'text/plain;charset=utf-8' });
@@ -3165,18 +3258,232 @@ export default function App() {
     void saveFolderToDb(updated);
   };
 
+  // Zero-Token Original-Source Timing Re-Sync for Already-Translated Folders:
+  // Re-locks exact original English VTT/SRT timestamps, headers (including X-TIMESTAMP-MAP),
+  // cue settings, and lossless template spans onto existing translated files without spending 1 AI token!
+  const handleResyncFolderTimings = async (folderId: string, fileList: FileList | File[]) => {
+    const folder = foldersRef.current.find((f) => f.id === folderId);
+    if (!folder || folder.files.length === 0) return;
+
+    const incoming = Array.from(fileList);
+    if (incoming.length === 0) return;
+
+    const normalizeMatchKey = (name: string) =>
+      name
+        .replace(/\.[^/.]+$/, '')
+        .replace(/(?:_bilingual)?_(?:fa|en|ar|persian|translated)$/i, '')
+        .trim()
+        .toLowerCase();
+
+    const refByKey = new Map<string, { file: File; text: string }>();
+    const refList: Array<{ file: File; text: string; key: string }> = [];
+
+    for (const refFile of incoming) {
+      try {
+        const buffer = await refFile.arrayBuffer();
+        const { text } = detectEncodingAndDecode(buffer, selectedEncoding);
+        const key = normalizeMatchKey(refFile.name);
+        refByKey.set(key, { file: refFile, text });
+        refList.push({ file: refFile, text, key });
+      } catch (err) {
+        console.warn('Failed reading reference subtitle file for timing resync:', refFile.name, err);
+      }
+    }
+
+    if (refList.length === 0) {
+      showToast(
+        uiLang === 'en' ? 'Could not read the selected reference subtitle file(s).' : 'خواندن فایل‌های مرجع انتخاب‌شده ممکن نبود.',
+        'warning'
+      );
+      return;
+    }
+
+    let matchedFilesCount = 0;
+    let totalAdjustedCues = 0;
+    let maxDriftFixedMs = 0;
+    let countMismatchFiles = 0;
+    let headerRestoredFiles = 0;
+
+    const nextFiles = folder.files.map((existingFile) => {
+      const targetKey = normalizeMatchKey(existingFile.fileName);
+      let matchedRef = refByKey.get(targetKey);
+
+      // Single-file convenience fallback: if user selected 1 reference file and this is the
+      // active file (or the only file in the folder), match it directly
+      if (
+        !matchedRef &&
+        refList.length === 1 &&
+        (folder.files.length === 1 || existingFile.id === activeFileIdRef.current)
+      ) {
+        matchedRef = refList[0];
+      }
+
+      if (!matchedRef) return existingFile;
+
+      const report = resyncFileFromOriginalSource(existingFile.items, matchedRef.text, matchedRef.file.name);
+      if (report.originalCount === 0) return existingFile;
+
+      matchedFilesCount++;
+      totalAdjustedCues += report.adjustedCount;
+      if (report.maxFixedDriftMs > maxDriftFixedMs) maxDriftFixedMs = report.maxFixedDriftMs;
+      if (report.countMismatch) countMismatchFiles++;
+      if (report.hasXTimestampMap) headerRestoredFiles++;
+
+      return {
+        ...existingFile,
+        sourceFormat: report.sourceFormat,
+        rawHeader: report.rawHeader ?? existingFile.rawHeader,
+        rawSourceText: report.rawSourceText,
+        sourceCueSpans: report.sourceCueSpans,
+        items: report.items,
+      };
+    });
+
+    if (matchedFilesCount === 0) {
+      showToast(
+        uiLang === 'en'
+          ? 'No matching filenames found in this folder. Select original English files with the same base names.'
+          : 'هیچ فایل هم‌نامی در این پوشه یافت نشد. لطفاً فایل‌های انگلیسی اصلی با همان نام فایل را انتخاب کنید.',
+        'warning'
+      );
+      return;
+    }
+
+    const updatedFolder: SubtitleFolder = {
+      ...folder,
+      updatedAt: Date.now(),
+      files: nextFiles,
+    };
+
+    foldersRef.current = foldersRef.current.map((f) => (f.id === folderId ? updatedFolder : f));
+    setFolders(foldersRef.current);
+    void saveFolderToDb(updatedFolder);
+
+    // Refresh active editor if the active file was re-synced
+    if (activeFolderIdRef.current === folderId && activeFileIdRef.current) {
+      const updatedActiveFile = nextFiles.find((fl) => fl.id === activeFileIdRef.current) || null;
+      if (updatedActiveFile) {
+        loadFolderFileIntoEditor(updatedActiveFile);
+      }
+    }
+
+    const driftSec = (maxDriftFixedMs / 1000).toFixed(3);
+    showToast(
+      uiLang === 'en'
+        ? `Timing locked 1:1 on ${matchedFilesCount} file(s) (${totalAdjustedCues} cues adjusted, max drift fixed ${driftSec}s${headerRestoredFiles > 0 ? `, ${headerRestoredFiles} X-TIMESTAMP-MAP restored` : ''}${countMismatchFiles > 0 ? `, ${countMismatchFiles} cue-count rebuilt` : ''}). Zero tokens used!`
+        : `تایم‌بندی ${matchedFilesCount} فایل با فایل انگلیسی اصلی ۱:۱ قفل شد (${totalAdjustedCues} خط اصلاح شد، بیشترین جابه‌جایی اصلاح‌شده ${driftSec} ثانیه${headerRestoredFiles > 0 ? `، ${headerRestoredFiles} هدر استریم X-TIMESTAMP-MAP بازیابی شد` : ''}${countMismatchFiles > 0 ? `، ${countMismatchFiles} فایل با بازسازی دقیق شمارش خطوط` : ''}) — بدون مصرف توکن!`,
+      'success'
+    );
+  };
+
+  // Zero-Token 1-Click Timing Upgrade for ANY Existing Translated Folder (NO Re-Translation!)
+  const handleUpgradeFolderTiming = (folderId: string) => {
+    const folder = foldersRef.current.find((f) => f.id === folderId);
+    if (!folder || folder.files.length === 0) {
+      showToast(uiLang === 'en' ? 'No files in folder to upgrade.' : 'فایلی در این پوشه وجود ندارد.', 'warning');
+      return;
+    }
+
+    const report = upgradeFolderWithNewTimingEngine(folder, targetLanguage, appendRTLMarkers);
+    foldersRef.current = foldersRef.current.map((f) => (f.id === folderId ? report.folder : f));
+    setFolders(foldersRef.current);
+    void saveFolderToDb(report.folder);
+
+    if (activeFolderIdRef.current === folderId && activeFileIdRef.current) {
+      const updatedActiveFile = report.folder.files.find((fl) => fl.id === activeFileIdRef.current) || null;
+      if (updatedActiveFile) {
+        loadFolderFileIntoEditor(updatedActiveFile);
+      }
+    }
+
+    const shiftWarningFa = report.filesWithSuspectedTextShift.length > 0
+      ? ` (هشدار: در ${report.filesWithSuspectedTextShift.length} فایل احتمال جابه‌جایی متن از ترجمه قدیمی دیده شد)`
+      : '';
+    const shiftWarningEn = report.filesWithSuspectedTextShift.length > 0
+      ? ` (Note: ${report.filesWithSuspectedTextShift.length} file(s) show suspected legacy text shift)`
+      : '';
+
+    showToast(
+      uiLang === 'en'
+        ? `Folder "${folder.name}" upgraded to new zero-drift timing engine (${report.filesProcessed} files, ${report.totalFixedTimestamps} timestamps locked, ${report.totalSanitizedPayloads} payloads cleaned, 0 tokens). Ready to download!${shiftWarningEn}`
+        : `تایم‌بندی پوشه «${folder.name}» با متد جدید اصلاح و قفل شد (${report.filesProcessed} فایل، ${report.totalFixedTimestamps} تایم‌کد استاندارد، ${report.totalSanitizedPayloads} خط پاکسازی‌شده — بدون ترجمه مجدد). آماده دانلود!${shiftWarningFa}`,
+      report.filesWithSuspectedTextShift.length > 0 ? 'warning' : 'success'
+    );
+  };
+
+  // Zero-Token 1-Click Timing Upgrade for ALL Saved Folders at Once!
+  const handleUpgradeAllFoldersTiming = () => {
+    const allFolders = foldersRef.current;
+    if (allFolders.length === 0) {
+      showToast(uiLang === 'en' ? 'No folders found.' : 'هیچ پوشه‌ای یافت نشد.', 'warning');
+      return;
+    }
+
+    let totalFiles = 0;
+    let totalFixedTimestamps = 0;
+    let totalSanitizedPayloads = 0;
+    let totalRemovedOrphans = 0;
+    let totalSuspectedShiftFiles = 0;
+
+    const upgradedFolders = allFolders.map((folder) => {
+      if (folder.files.length === 0) return folder;
+      const report = upgradeFolderWithNewTimingEngine(folder, targetLanguage, appendRTLMarkers);
+      totalFiles += report.filesProcessed;
+      totalFixedTimestamps += report.totalFixedTimestamps;
+      totalSanitizedPayloads += report.totalSanitizedPayloads;
+      totalRemovedOrphans += report.totalRemovedOrphanHeaders;
+      totalSuspectedShiftFiles += report.filesWithSuspectedTextShift.length;
+      void saveFolderToDb(report.folder);
+      return report.folder;
+    });
+
+    foldersRef.current = upgradedFolders;
+    setFolders(upgradedFolders);
+
+    if (activeFolderIdRef.current && activeFileIdRef.current) {
+      const curFolder = upgradedFolders.find((f) => f.id === activeFolderIdRef.current);
+      const curFile = curFolder?.files.find((fl) => fl.id === activeFileIdRef.current) || null;
+      if (curFile) {
+        loadFolderFileIntoEditor(curFile);
+      }
+    }
+
+    showToast(
+      uiLang === 'en'
+        ? `Upgraded ALL ${upgradedFolders.length} folders (${totalFiles} files, ${totalFixedTimestamps} timestamps locked, ${totalSanitizedPayloads} payloads cleaned${totalRemovedOrphans > 0 ? `, ${totalRemovedOrphans} broken headers fixed` : ''}) with 0 tokens!${totalSuspectedShiftFiles > 0 ? ` (${totalSuspectedShiftFiles} file(s) flagged for possible legacy AI text shift)` : ''}`
+        : `تایم‌بندی همه ${upgradedFolders.length} پوشه (${totalFiles} فایل) یکجا با متد جدید اصلاح و قفل شد (${totalFixedTimestamps} تایم‌کد، ${totalSanitizedPayloads} خط پاکسازی‌شده${totalRemovedOrphans > 0 ? `، ${totalRemovedOrphans} هدر خراب اصلاح‌شده` : ''}) — بدون ترجمه مجدد!${totalSuspectedShiftFiles > 0 ? ` (${totalSuspectedShiftFiles} فایل با هشدار احتمال جابه‌جایی متن قدیمی مشخص شدند)` : ''}`,
+      totalSuspectedShiftFiles > 0 ? 'warning' : 'success'
+    );
+  };
+
   // Fast Batch Export Entire Folder in SRT or VTT (.ZIP)
-  const handleBatchExportFolder = (format: 'srt' | 'vtt') => {
-    const folder = foldersRef.current.find((f) => f.id === activeFolderIdRef.current);
+  // Automatically runs the new zero-drift timing upgrade engine on every file before exporting!
+  const handleBatchExportFolder = (format: 'srt' | 'vtt', targetFolderId?: string) => {
+    const resolvedFolderId = targetFolderId || activeFolderIdRef.current;
+    const folder = foldersRef.current.find((f) => f.id === resolvedFolderId);
     if (!folder || folder.files.length === 0) {
       showToast(uiLang === 'en' ? 'No files in folder to export.' : 'فایلی در پوشه برای خروجی گرفتن وجود ندارد.', 'warning');
       return;
     }
 
+    // Automatically upgrade any legacy files in this folder to the new zero-drift timing engine (0 tokens!)
+    const upgradeReport = upgradeFolderWithNewTimingEngine(folder, targetLanguage, appendRTLMarkers);
+    const activeFiles = upgradeReport.folder.files;
+    if (upgradeReport.filesChanged > 0) {
+      foldersRef.current = foldersRef.current.map((f) => (f.id === folder.id ? upgradeReport.folder : f));
+      setFolders(foldersRef.current);
+      void saveFolderToDb(upgradeReport.folder);
+      if (activeFolderIdRef.current === folder.id && activeFileIdRef.current) {
+        const updatedActiveFile = activeFiles.find((fl) => fl.id === activeFileIdRef.current) || null;
+        if (updatedActiveFile) loadFolderFileIntoEditor(updatedActiveFile);
+      }
+    }
+
     const isRTL = RTL_LANGUAGES.includes(targetLanguage);
     let untranslatedFilesCount = 0;
+    let timingMismatchFiles = 0;
 
-    const entries = folder.files.map((file) => {
+    const entries = activeFiles.map((file) => {
       const fStats = getFileCompletionStats(file, targetLanguage);
       if (!fStats.isDone) untranslatedFilesCount++;
 
@@ -3189,14 +3496,36 @@ export default function App() {
             file.rawHeader,
             isRTL,
             appendRTLMarkers,
-            file.subFps || 25
+            file.subFps || 25,
+            {
+              rawSourceText: file.rawSourceText,
+              sourceFormat: file.sourceFormat,
+              sourceCueSpans: file.sourceCueSpans,
+            }
           );
+
+      if (!bilingualConfig?.enabled) {
+        const audit = verifySubtitleTimingIntegrity(file.items, content, format);
+        if (!audit.valid) {
+          timingMismatchFiles++;
+          console.error('[Folder Export Timing Audit Warning]', file.fileName, audit);
+        }
+      }
 
       return {
         name: `${baseName}.${format}`,
         content,
       };
     });
+
+    if (timingMismatchFiles > 0) {
+      showToast(
+        uiLang === 'en'
+          ? `Timing integrity warning on ${timingMismatchFiles} file(s). Use Re-sync Timings to lock against originals.`
+          : `هشدار کنترل تایم‌بندی در ${timingMismatchFiles} فایل! از دکمه «همگام‌سازی تایم‌بندی» استفاده کنید.`,
+        'warning'
+      );
+    }
 
     const zipBlob = createZipBlob(entries);
     const safeFolderName = folder.name.replace(/[<>:"/\\|?*\x00-\x1F]/g, '_').trim() || 'Subtitles';
@@ -3209,8 +3538,8 @@ export default function App() {
 
     showToast(
       uiLang === 'en'
-        ? `Exported ${entries.length} ${format.toUpperCase()} file(s) as ZIP${untranslatedFilesCount > 0 ? ` (${untranslatedFilesCount} partial)` : ''}.`
-        : `خروجی گروهی ${entries.length} فایل با فرمت ${format.toUpperCase()} آماده و دانلود شد${untranslatedFilesCount > 0 ? ` (${untranslatedFilesCount} فایل هنوز کامل ترجمه نشده بود)` : ''}.`,
+        ? `Exported ${entries.length} ${format.toUpperCase()} file(s) using the new 0ms timing engine${untranslatedFilesCount > 0 ? ` (${untranslatedFilesCount} partial)` : ''}.`
+        : `خروجی گروهی ${entries.length} فایل با فرمت ${format.toUpperCase()} و متد تایم‌بندی جدید (دقت ۱:۱) آماده و دانلود شد${untranslatedFilesCount > 0 ? ` (${untranslatedFilesCount} فایل هنوز کامل ترجمه نشده بود)` : ''}.`,
       untranslatedFilesCount > 0 ? 'info' : 'success'
     );
   };
@@ -3282,6 +3611,9 @@ export default function App() {
             onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
             onRetranslateFolder={handleRetranslateFolder}
             onCompleteMissingFolder={handleCompleteMissingFolder}
+            onUpgradeFolderTiming={handleUpgradeFolderTiming}
+            onUpgradeAllFoldersTiming={handleUpgradeAllFoldersTiming}
+            onResyncFolderTimings={handleResyncFolderTimings}
             onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
             onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
             targetLanguage={targetLanguage}
@@ -3327,6 +3659,9 @@ export default function App() {
                 onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
                 onRetranslateFolder={handleRetranslateFolder}
                 onCompleteMissingFolder={handleCompleteMissingFolder}
+                onUpgradeFolderTiming={handleUpgradeFolderTiming}
+                onUpgradeAllFoldersTiming={handleUpgradeAllFoldersTiming}
+                onResyncFolderTimings={handleResyncFolderTimings}
                 onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
                 onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
                 targetLanguage={targetLanguage}

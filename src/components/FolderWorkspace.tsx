@@ -32,6 +32,8 @@ import {
   RotateCcw,
   Wand2,
   AlertCircle,
+  ShieldCheck,
+  RefreshCw,
 } from 'lucide-react';
 
 interface FolderWorkspaceProps {
@@ -54,6 +56,9 @@ interface FolderWorkspaceProps {
   onTranslateConcurrentFiles?: (fileIds?: string[]) => void;
   onRetranslateFolder?: (folderId: string) => void;
   onCompleteMissingFolder?: (folderId: string) => void;
+  onUpgradeFolderTiming?: (folderId: string) => void;
+  onUpgradeAllFoldersTiming?: () => void;
+  onResyncFolderTimings?: (folderId: string, files: FileList | File[]) => Promise<void>;
   onBatchExportCompletedFiles?: (folderId: string, format: 'srt' | 'vtt') => void;
   onClearCompletedFilesBatch?: (folderId: string) => void;
   targetLanguage?: string;
@@ -72,7 +77,7 @@ interface FolderWorkspaceProps {
   onSelectFile: (fileId: string) => void;
   onEnterTranslationView: () => void;
   onExitTranslationView: () => void;
-  onBatchExportFolder: (format: 'srt' | 'vtt') => void;
+  onBatchExportFolder: (format: 'srt' | 'vtt', folderId?: string) => void;
   onLoadSampleToFolder: () => void;
 }
 
@@ -96,6 +101,9 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   onTranslateConcurrentFiles,
   onRetranslateFolder,
   onCompleteMissingFolder,
+  onUpgradeFolderTiming,
+  onUpgradeAllFoldersTiming,
+  onResyncFolderTimings,
   onBatchExportCompletedFiles,
   onClearCompletedFilesBatch,
   targetLanguage = 'fa',
@@ -128,6 +136,7 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   const dirInputRef = useRef<HTMLInputElement>(null);
   const quickAddFileInputRef = useRef<HTMLInputElement>(null);
   const backupImportInputRef = useRef<HTMLInputElement>(null);
+  const resyncTimingsInputRef = useRef<HTMLInputElement>(null);
 
   const isFileCurrentlyTranslating = (fileId: string) =>
     translatingFileIds.includes(fileId) || translatingFileId === fileId;
@@ -431,6 +440,47 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 </button>
               )}
 
+              {onUpgradeFolderTiming && (
+                <button
+                  type="button"
+                  onClick={() => onUpgradeFolderTiming(activeFolder.id)}
+                  disabled={isTranslating || activeFolder.files.length === 0}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold text-teal-800 dark:text-teal-200 bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 dark:hover:bg-teal-900/60 border border-teal-300 dark:border-teal-700 disabled:opacity-45 transition-all active:scale-95 shrink-0"
+                  title={isEn ? 'Instantly upgrade this folder to the new zero-drift timing engine without re-translating (0 tokens)' : 'اصلاح و ارتقای فوری تایم‌بندی همه فایل‌های این پوشه به متد جدید بدون ترجمه مجدد'}
+                >
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>{isEn ? 'Apply New Timing (0 Tokens)' : 'اصلاح تایم‌بندی پوشه (جدید)'}</span>
+                </button>
+              )}
+
+              {onResyncFolderTimings && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => resyncTimingsInputRef.current?.click()}
+                    disabled={isTranslating || activeFolder.files.length === 0}
+                    className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold text-cyan-800 dark:text-cyan-200 bg-cyan-50 hover:bg-cyan-100 dark:bg-cyan-950/50 dark:hover:bg-cyan-900/60 border border-cyan-300 dark:border-cyan-700 disabled:opacity-45 transition-all active:scale-95 shrink-0"
+                    title={isEn ? 'Re-lock 1:1 original English VTT/SRT timestamps onto already-translated files (0 AI tokens)' : 'قفل مجدد تایم‌بندی ۱:۱ از روی فایل‌های انگلیسی اصلی (برای بازیابی هدر استریم X-TIMESTAMP-MAP)'}
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>{isEn ? 'Sync from Original File' : 'همگام‌سازی با فایل انگلیسی'}</span>
+                  </button>
+                  <input
+                    ref={resyncTimingsInputRef}
+                    type="file"
+                    multiple
+                    accept=".srt,.vtt,.ass,.ssa,.sub,.txt"
+                    className="hidden"
+                    onChange={(e) => {
+                      if (e.target.files && e.target.files.length > 0) {
+                        void onResyncFolderTimings(activeFolder.id, e.target.files);
+                      }
+                      e.target.value = '';
+                    }}
+                  />
+                </>
+              )}
+
               {onRetranslateFolder && (
                 <button
                   type="button"
@@ -596,6 +646,32 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                         {completedBatchIdSet.has(file.id) && (
                           <span className="text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30 shrink-0">
                             {isEn ? 'Fixed' : 'تکمیل‌شده'}
+                          </span>
+                        )}
+                        {Boolean(file.rawSourceText && file.sourceCueSpans && file.sourceCueSpans.length === file.items.length) ? (
+                          <span
+                            className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border border-cyan-500/30 shrink-0"
+                            title={isEn ? 'Lossless 1:1 original timestamp template locked' : 'الگوی تایم‌بندی اصلی ۱:۱ بدون تغییر قفل شده است'}
+                          >
+                            <ShieldCheck className="w-2.5 h-2.5" />
+                            <span>1:1</span>
+                          </span>
+                        ) : file.timingUpgradedAt ? (
+                          <span
+                            className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-700 dark:text-teal-300 border border-teal-500/30 shrink-0"
+                            title={isEn ? 'Upgraded to new zero-drift timing engine' : 'به موتور تایم‌بندی جدید (دقت صفر میلی‌ثانیه) ارتقا یافت'}
+                          >
+                            <ShieldCheck className="w-2.5 h-2.5" />
+                            <span>{isEn ? 'Synced' : 'تایم‌بندی جدید'}</span>
+                          </span>
+                        ) : null}
+                        {(file.suspectedShiftCuesCount || 0) > 0 && (
+                          <span
+                            className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35 shrink-0"
+                            title={isEn ? 'Possible legacy AI text shift detected on adjacent cues' : 'احتمال جابه‌جایی متن بین خطوط در ترجمه قدیمی شناسایی شد'}
+                          >
+                            <AlertCircle className="w-2.5 h-2.5" />
+                            <span>{isEn ? 'Shift?' : 'بررسی متن'}</span>
                           </span>
                         )}
                       </div>
@@ -782,20 +858,34 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* LEFT / START: Step 1 - Folder Manager */}
           <div className="lg:col-span-5 flex flex-col gap-3.5 bg-slate-50/80 dark:bg-slate-950/50 p-4 rounded-2xl border border-slate-200 dark:border-slate-800">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
               <h3 className="text-xs font-bold text-slate-800 dark:text-slate-200 flex items-center gap-1.5">
                 <Folder className="w-4 h-4 text-indigo-500" />
                 <span>{isEn ? 'Step 1: Project Folders' : 'مرحله ۱: پوشه‌های پروژه'}</span>
               </h3>
-              <button
-                type="button"
-                onClick={() => dirInputRef.current?.click()}
-                className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 transition-colors"
-                title={isEn ? 'Import an entire folder from your device' : 'وارد کردن مستقیم یک پوشه از سیستم'}
-              >
-                <FolderUp className="w-3.5 h-3.5" />
-                <span>{isEn ? 'Import Folder' : 'آپلود پوشه از سیستم'}</span>
-              </button>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                {onUpgradeAllFoldersTiming && folders.some((f) => f.files.length > 0) && (
+                  <button
+                    type="button"
+                    onClick={onUpgradeAllFoldersTiming}
+                    disabled={isTranslating}
+                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 dark:hover:bg-teal-900/60 text-teal-700 dark:text-teal-300 border border-teal-300 dark:border-teal-700 disabled:opacity-45 transition-colors"
+                    title={isEn ? 'Upgrade ALL saved folders to the new zero-drift timing engine in 1 click (0 tokens, no re-translation)' : 'اصلاح و ارتقای تایم‌بندی همه پوشه‌های ذخیره‌شده به متد جدید با یک کلیک بدون ترجمه مجدد'}
+                  >
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>{isEn ? 'Fix All Timings' : 'اصلاح تایم‌بندی همه پوشه‌ها'}</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => dirInputRef.current?.click()}
+                  className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-semibold bg-indigo-50 hover:bg-indigo-100 dark:bg-indigo-950/50 dark:hover:bg-indigo-900/60 text-indigo-700 dark:text-indigo-300 border border-indigo-200 dark:border-indigo-800 transition-colors"
+                  title={isEn ? 'Import an entire folder from your device' : 'وارد کردن مستقیم یک پوشه از سیستم'}
+                >
+                  <FolderUp className="w-3.5 h-3.5" />
+                  <span>{isEn ? 'Import Folder' : 'آپلود پوشه از سیستم'}</span>
+                </button>
+              </div>
               <input
                 ref={dirInputRef}
                 type="file"
@@ -989,6 +1079,60 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                           </div>
                         )}
                       </div>
+
+                      {/* Quick Timing Upgrade + Direct VTT/SRT Export Strip on EVERY Folder Card */}
+                      {!isEditing && folder.files.length > 0 && (
+                        <div
+                          className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-800/80 text-[10px] flex-wrap"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="flex items-center gap-1.5">
+                            {onUpgradeFolderTiming && (
+                              <button
+                                type="button"
+                                onClick={() => onUpgradeFolderTiming(folder.id)}
+                                disabled={isTranslating}
+                                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md font-bold border transition-colors disabled:opacity-40 ${
+                                  folder.files.every((fl) => Boolean(fl.timingUpgradedAt))
+                                    ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300 border-teal-500/35 hover:bg-teal-500/25'
+                                    : 'bg-cyan-50 hover:bg-cyan-100 dark:bg-cyan-950/50 dark:hover:bg-cyan-900/60 text-cyan-700 dark:text-cyan-300 border-cyan-300 dark:border-cyan-700'
+                                }`}
+                                title={isEn ? 'Fix & lock timings with new engine (0 tokens, no re-translation)' : 'اصلاح تایم‌بندی این پوشه با متد جدید بدون ترجمه مجدد'}
+                              >
+                                <ShieldCheck className="w-3 h-3" />
+                                <span>
+                                  {folder.files.every((fl) => Boolean(fl.timingUpgradedAt))
+                                    ? (isEn ? 'New Timing ✓' : 'تایم‌بندی جدید ✓')
+                                    : (isEn ? 'Fix Timing' : 'اصلاح تایم‌بندی')}
+                                </span>
+                              </button>
+                            )}
+                          </div>
+
+                          <div className="flex items-center gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => onBatchExportFolder('vtt', folder.id)}
+                              disabled={isTranslating}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-sky-600 hover:bg-sky-500 text-white font-bold transition-colors disabled:opacity-40"
+                              title={isEn ? 'Download folder as .VTT ZIP with new timing engine' : 'دانلود گروهی کل این پوشه با فرمت VTT و تایم‌بندی جدید'}
+                            >
+                              <Download className="w-2.5 h-2.5" />
+                              <span>VTT</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => onBatchExportFolder('srt', folder.id)}
+                              disabled={isTranslating}
+                              className="inline-flex items-center gap-1 px-2 py-1 rounded-md bg-emerald-600 hover:bg-emerald-500 text-white font-bold transition-colors disabled:opacity-40"
+                              title={isEn ? 'Download folder as .SRT ZIP with new timing engine' : 'دانلود گروهی کل این پوشه با فرمت SRT و تایم‌بندی جدید'}
+                            >
+                              <Download className="w-2.5 h-2.5" />
+                              <span>SRT</span>
+                            </button>
+                          </div>
+                        </div>
+                      )}
 
                       {/* Separate download row on folder card for recently completed files */}
                       {!isEditing && folderCompletedBatch.length > 0 && onBatchExportCompletedFiles && (

@@ -17,6 +17,7 @@ export type CustomProviderErrorType =
   | 'truncated_response'
   | 'malformed_json'
   | 'missing_translations'
+  | 'id_alignment_mismatch'
   | 'response_too_large'
   | 'request_too_large'
   | 'cancelled'
@@ -138,20 +139,35 @@ export interface LanguageOption {
 
 export interface SubtitleItem {
   id: number;
-  startTime: string;  // e.g. "00:01:20,500" or "00:01:20.50"
-  endTime: string;    // e.g. "00:01:24,100"
+  startTime: string;      // Canonical ASCII timestamp e.g. "00:01:20,500" or "00:01:20.500"
+  endTime: string;        // Canonical ASCII timestamp e.g. "00:01:24,100" or "00:01:24.100"
   startSeconds: number;
   endSeconds: number;
+  startMs?: number;       // Exact integer milliseconds (zero floating-point drift)
+  endMs?: number;         // Exact integer milliseconds (zero floating-point drift)
+  rawStartTime?: string;  // Exact original start timestamp string from source file
+  rawEndTime?: string;    // Exact original end timestamp string from source file
+  cueSettings?: string;   // Preserved WebVTT cue settings (e.g. align:start position:10%)
   originalText: string;
   translatedText: string;
-  styleTags?: string; // ASS/SSA styling or header tags if any
-  cueId?: string;     // FIX (L9): WebVTT cue identifier preserved from the source file
+  styleTags?: string;     // ASS/SSA styling or header tags if any
+  cueId?: string;         // WebVTT cue identifier preserved from the source file
   isEditing?: boolean;
   sourceModified?: boolean;
   gameKey?: string;
   context?: string;
   variables?: string[];
   rawRowData?: Record<string, any>;
+}
+
+export interface SubtitleCueSpan {
+  id: number;
+  textStart: number;
+  textEnd: number;
+  startMs: number;
+  endMs: number;
+  startTime: string;
+  endTime: string;
 }
 
 export interface GameLocalizationItem {
@@ -241,6 +257,8 @@ export interface ModeSessionState {
   sourceFormat: SubtitleFormat | GameFormat;
   targetFormat: SubtitleFormat | GameFormat;
   rawHeader?: string;
+  rawSourceText?: string;
+  sourceCueSpans?: SubtitleCueSpan[];
   selectedEncoding: string;
   detectedEncoding: string;
   items: SubtitleItem[];
@@ -267,12 +285,16 @@ export interface SubtitleFolderFile {
   fileSize: number;
   sourceFormat: SubtitleFormat;
   rawHeader?: string;
+  rawSourceText?: string;
+  sourceCueSpans?: SubtitleCueSpan[];
   detectedEncoding: string;
   subFps?: number;
   items: SubtitleItem[];
   status: 'pending' | 'translating' | 'done' | 'error';
   createdAt: number;
   assignedKeyId?: string;
+  timingUpgradedAt?: number;
+  suspectedShiftCuesCount?: number;
 }
 
 export interface SubtitleFolder {

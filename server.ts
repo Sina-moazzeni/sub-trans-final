@@ -18,7 +18,9 @@ import {
   sanitizeErrorMessage,
   normalizeOpenAiTranslationResponse,
   extractJsonFromText,
-  classifyCustomProviderError
+  classifyCustomProviderError,
+  auditBatchAlignment,
+  stripAccidentalTimestamps
 } from './src/lib/customProviderService';
 
 dotenv.config();
@@ -689,7 +691,7 @@ Tone: ${toneDescription}
 ${userCustomPrompt ? `Custom Instruction: "${userCustomPrompt}"` : ''}
 
 CRITICAL LOCALIZATION RULES:
-1. STRICT 1:1 TIMING & ID ALIGNMENT: Translate ONLY the text fields. Retain all item IDs and ordering 1:1. NEVER merge two consecutive subtitle items into one, NEVER shift dialogue across different IDs, NEVER emit blank lines (double newlines) or "-->" inside any translated text, and NEVER leave English lines untranslated into ${targetLanguage}.
+1. STRICT 1:1 TIMING & CUE-BOUNDARY LOCK: Translate ONLY the text inside each item's "text" field. Retain every exact input "id" 1:1 with ZERO missing, extra, or duplicate IDs. Even when one English sentence spans two or three consecutive cues, translate ONLY the words belonging to cue N inside cue N — NEVER borrow words from cue N+1 into cue N or push words from cue N into cue N+1 (moving words across cue boundaries makes subtitles appear seconds early or late on video!). NEVER merge two cues, NEVER emit blank lines (\\n\\n) or "-->" inside text, and NEVER leave English lines untranslated into ${targetLanguage}.
 2. VARIABLE & TAG ISOLATION: Retain tags (<i>, <b>, {\\pos(...)}), system variables ({player_name}, %s, $amount, [TAG]) exactly without translation or modification.
 3. UNCENSORED FIDELITY: When the tone is 'expose', 'humorous', 'conversational', or 'epic', translate every statement, exposé claim, profanity, slang, and sensitive expression directly and authentically with zero censorship, softening, or omission.
 4. OUTPUT FORMAT: Respond ONLY with a valid JSON object matching this schema:
@@ -1008,17 +1010,65 @@ app.post('/api/translate', aiRateLimiter, async (req, res) => {
       }
 
       try {
-        const customResult = await translateWithCustomProvider({
-          customProvider,
-          items,
-          sourceLanguage,
-          targetLanguage,
-          tone,
-          customPrompt,
-          mode,
-          requestId,
-          clientSignal: clientAbortController.signal,
-        });
+        let customResult;
+        try {
+          customResult = await translateWithCustomProvider({
+            customProvider,
+            items,
+            sourceLanguage,
+            targetLanguage,
+            tone,
+            customPrompt,
+            mode,
+            requestId,
+            clientSignal: clientAbortController.signal,
+          });
+        } catch (firstErr: any) {
+          const isAlignmentOrMissing =
+            firstErr?.errorType === 'id_alignment_mismatch' ||
+            firstErr?.errorType === 'missing_translations';
+
+          if (isAlignmentOrMissing && items.length > 8 && !clientAbortController.signal.aborted) {
+            console.warn(
+              `[CustomProvider Anti-Shift] ${requestId}: ${firstErr.errorType} on ${items.length}-line batch. Auto-splitting into safe 8-line sub-batches...`
+            );
+            const mergedTranslations: Array<{ id: number; text: string }> = [];
+            let detectedLang = 'Auto-detect';
+            let lastSubResult: any = null;
+            const SAFE_SUB_BATCH = 8;
+
+            for (let s = 0; s < items.length; s += SAFE_SUB_BATCH) {
+              const subItems = items.slice(s, s + SAFE_SUB_BATCH);
+              const subRes = await translateWithCustomProvider({
+                customProvider,
+                items: subItems,
+                sourceLanguage,
+                targetLanguage,
+                tone,
+                customPrompt,
+                mode,
+                requestId: `${requestId}_sub${Math.floor(s / SAFE_SUB_BATCH) + 1}`,
+                clientSignal: clientAbortController.signal,
+              });
+              mergedTranslations.push(...subRes.translations);
+              if (subRes.detectedSourceLanguage && subRes.detectedSourceLanguage !== 'Auto-detect') {
+                detectedLang = subRes.detectedSourceLanguage;
+              }
+              lastSubResult = subRes;
+            }
+
+            customResult = {
+              translations: mergedTranslations,
+              detectedSourceLanguage: detectedLang,
+              modelUsed: lastSubResult?.modelUsed || customProvider.model.trim(),
+              isFallback: false,
+              timings: lastSubResult?.timings || { request_start: Date.now(), elapsed_ms: 0 },
+              responseBytes: lastSubResult?.responseBytes || 0,
+            };
+          } else {
+            throw firstErr;
+          }
+        }
 
         // Telemetry Logging in Dev/Debug without logging API keys or prompts (Requirement 2)
         const t = customResult.timings;
@@ -1066,8 +1116,10 @@ User Custom Instruction: "${userCustomPrompt || 'None'}"
 ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue, UI, Quests, Items, Lore)' : 'Operational Mode: Movie & TV Subtitles (Cinema Engine)'}
 
 [CRITICAL CONSTRAINTS - DO NOT VIOLATE]
-1. PRESERVE STRUCTURE & 1:1 TIMING LOCK:
-   - For Movies: NEVER alter or omit any timecode, index number, or line spacing. Keep strict 1:1 alignment between each input "id" and its corresponding output "id". NEVER shift text from one ID to an adjacent ID, NEVER merge two lines, and NEVER insert empty blank lines (\\n\\n) or "-->" inside a subtitle line.
+1. PRESERVE STRUCTURE & 1:1 TIMING / CUE-BOUNDARY LOCK:
+   - For Movies: NEVER alter or omit any timecode, index number, or line spacing. Keep strict 1:1 alignment between each input "id" and its exact corresponding output "id" with ZERO extra, missing, or duplicate IDs.
+   - STRICT CUE-BOUNDARY RULE: Even when an English sentence continues across two or three consecutive cues, translate ONLY the exact words spoken inside cue N inside cue N's "text". NEVER pull words from cue N+1 into cue N and NEVER push words from cue N into cue N+1 — shifting words across cue boundaries causes subtitles to appear seconds early or late on video!
+   - NEVER merge two lines, NEVER insert blank lines (\\n\\n) or "-->" inside a subtitle line.
    - For Games: NEVER alter JSON keys, CSV separators, or structural IDs. Translate ONLY the target text fields.
    - You MUST translate EVERY SINGLE non-empty input item into ${targetLanguage}. Do NOT omit, skip, return empty strings, or leave source English text untranslated. Every item in input MUST have a matching object in the "translations" array.
 
@@ -1212,12 +1264,106 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
       };
 
       const rawTranslations = Array.isArray(parsedData.translations) ? parsedData.translations : [];
-      const translationMap = new Map<number, string>();
-      rawTranslations.forEach((t: any) => {
-        if (t && typeof t.id === 'number') {
-          translationMap.set(t.id, String(t.text ?? ''));
+      const initialAudit = auditBatchAlignment(items, rawTranslations);
+      const translationMap = new Map<number, string>(initialAudit.translationMap);
+
+      // Strict Anti-Shift Integrity Gate + Automatic Safe Sub-Batch Split Recovery:
+      // Detects unexpectedIds, duplicateIds, outOfOrderIds, tailDropShift (cue-merge shift!),
+      // and consecutiveDuplicateShift. NEVER patches the tail of a shifted batch!
+      if (initialAudit.hasShiftRisk) {
+        console.warn(
+          `[Translate Anti-Shift] ${requestId}: Detected shift risk on ${items.length}-line batch (${initialAudit.shiftReasons.join('; ')}).`
+        );
+
+        if (items.length > 8 && !clientAbortController.signal.aborted) {
+          console.warn(
+            `[Translate Anti-Shift] ${requestId}: Auto-splitting into safe 8-line sub-batches to guarantee 1:1 timestamp lock...`
+          );
+          translationMap.clear();
+          const SAFE_SUB_BATCH = 8;
+
+          for (let s = 0; s < items.length; s += SAFE_SUB_BATCH) {
+            const subItems = items.slice(s, s + SAFE_SUB_BATCH);
+            const subPrompt = `Translate the following ${subItems.length} ${mode === 'game' ? 'game strings' : 'subtitle lines'} into ${targetLanguage} (Source language: ${sourceLanguage || 'Auto-detect'}). STRICT 1:1 ID LOCK — NEVER merge adjacent cues and NEVER shift words across IDs:\n` +
+              JSON.stringify(subItems, null, 2);
+
+            const { response: subResp } = await callGeminiWithRetryAndFallback(apiKeys, {
+              contents: subPrompt,
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                safetySettings: [
+                  { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                  { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                  { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                  { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                  { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE },
+                ],
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: {
+                    detectedSourceLanguage: { type: Type.STRING },
+                    translations: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          id: { type: Type.INTEGER },
+                          text: { type: Type.STRING }
+                        },
+                        required: ['id', 'text']
+                      }
+                    }
+                  },
+                  required: ['translations']
+                }
+              }
+            }, modelUsed, clientAbortController.signal);
+
+            let subParsed: any = null;
+            try {
+              subParsed = JSON.parse(subResp.text || '{}');
+            } catch {
+              return res.status(502).json({
+                success: false,
+                error: 'خطا در قالب‌بندی زیربسته ضدجابه‌جایی. در حال تلاش مجدد...',
+                errorType: 'malformed_json',
+                retryable: true,
+                requestId,
+                jobId,
+              });
+            }
+
+            const subAudit = auditBatchAlignment(subItems, Array.isArray(subParsed?.translations) ? subParsed.translations : []);
+            if (subAudit.hasShiftRisk) {
+              console.warn(
+                `[Translate Anti-Shift] ${requestId}: Sub-batch still shifted (${subAudit.shiftReasons.join('; ')}). Rejecting batch.`
+              );
+              return res.status(502).json({
+                success: false,
+                error: 'عدم تطابق شناسه خطوط در پاسخ مدل (جلوگیری از جابه‌جایی تایم‌بندی). در حال تلاش مجدد...',
+                errorType: 'id_alignment_mismatch',
+                retryable: true,
+                requestId,
+                jobId,
+              });
+            }
+
+            subAudit.translationMap.forEach((val, key) => {
+              translationMap.set(key, val);
+            });
+          }
+        } else {
+          return res.status(502).json({
+            success: false,
+            error: 'عدم تطابق شناسه خطوط در پاسخ مدل (جلوگیری از جابه‌جایی تایم‌بندی). در حال تلاش مجدد...',
+            errorType: 'id_alignment_mismatch',
+            retryable: true,
+            requestId,
+            jobId,
+          });
         }
-      });
+      }
 
       const hardMissingIds: number[] = [];
       const untranslatedIds: number[] = [];
@@ -1235,8 +1381,8 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
       const idsToRepair = Array.from(new Set([...hardMissingIds, ...untranslatedIds]));
 
       if (idsToRepair.length > 0) {
-        // FIX (B19 + Incomplete English Repair): run ONE targeted repair call containing ONLY the
-        // missing, empty, or untranslated English ids so batches reach 100% without wasting tokens.
+        // Targeted repair ONLY runs after the anti-shift gate confirmed IDs are cleanly anchored
+        // (i.e. isolated middle gap or untranslated English line — NEVER a shifted tail!).
         const repairItems = items.filter((inputItem: any) => idsToRepair.includes(inputItem.id));
         let hardRepaired = hardMissingIds.length === 0;
         try {
@@ -1277,9 +1423,10 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
 
           const repairParsed = JSON.parse(repairResponse.text || '{}');
           const repairList = Array.isArray(repairParsed.translations) ? repairParsed.translations : [];
+          const repairAllowedIds = new Set<number>(repairItems.map((it: any) => Number(it.id)));
           repairList.forEach((t: any) => {
-            if (t && typeof t.id === 'number') {
-              const repairedText = String(t.text ?? '');
+            if (t && typeof t.id === 'number' && repairAllowedIds.has(t.id)) {
+              const repairedText = stripAccidentalTimestamps(String(t.text ?? ''));
               if (repairedText.trim().length > 0 || !translationMap.has(t.id)) {
                 translationMap.set(t.id, repairedText);
               }
@@ -1319,8 +1466,7 @@ ${mode === 'game' ? 'Operational Mode: Video Game Localization Engine (Dialogue,
         }
       }
 
-      // FIX (B19 follow-up): always rebuild from translationMap so entries recovered by the
-      // targeted repair pass (or future salvage paths) are included in the final payload.
+      // Rebuild strictly from audited translationMap in exact original input order
       const finalTranslations = items.map((inputItem: any) => ({
         id: inputItem.id,
         text: translationMap.has(inputItem.id) ? translationMap.get(inputItem.id)! : '',

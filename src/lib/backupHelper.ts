@@ -37,6 +37,11 @@ function sanitizeSubtitleItem(raw: any, fallbackIndex: number): SubtitleItem {
     endTime: typeof raw?.endTime === 'string' ? toEnglishDigits(raw.endTime) : '00:00:05,000',
     startSeconds: typeof raw?.startSeconds === 'number' && !isNaN(raw.startSeconds) ? raw.startSeconds : 0,
     endSeconds: typeof raw?.endSeconds === 'number' && !isNaN(raw.endSeconds) ? raw.endSeconds : 5,
+    startMs: typeof raw?.startMs === 'number' && Number.isFinite(raw.startMs) ? Math.round(raw.startMs) : undefined,
+    endMs: typeof raw?.endMs === 'number' && Number.isFinite(raw.endMs) ? Math.round(raw.endMs) : undefined,
+    rawStartTime: typeof raw?.rawStartTime === 'string' ? toEnglishDigits(raw.rawStartTime) : undefined,
+    rawEndTime: typeof raw?.rawEndTime === 'string' ? toEnglishDigits(raw.rawEndTime) : undefined,
+    cueSettings: typeof raw?.cueSettings === 'string' ? raw.cueSettings : undefined,
     originalText: typeof raw?.originalText === 'string' ? raw.originalText : String(raw?.originalText ?? ''),
     translatedText: typeof raw?.translatedText === 'string' ? raw.translatedText : String(raw?.translatedText ?? ''),
     styleTags: typeof raw?.styleTags === 'string' ? raw.styleTags : undefined,
@@ -56,18 +61,34 @@ function sanitizeFolderFile(raw: any, idx: number): SubtitleFolderFile | null {
   const validFormats = new Set<SubtitleFormat>(['srt', 'vtt', 'ass', 'ssa', 'sub']);
   const format: SubtitleFormat = validFormats.has(raw.sourceFormat) ? raw.sourceFormat : 'srt';
 
+  const validSpans = Array.isArray(raw.sourceCueSpans)
+    ? raw.sourceCueSpans.filter(
+        (sp: any) =>
+          sp &&
+          typeof sp.id === 'number' &&
+          typeof sp.textStart === 'number' &&
+          typeof sp.textEnd === 'number' &&
+          typeof sp.startMs === 'number' &&
+          typeof sp.endMs === 'number'
+      )
+    : undefined;
+
   const sanitizedFile: SubtitleFolderFile = {
     id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : `file_${Date.now().toString(36)}_${idx}`,
     fileName: typeof raw.fileName === 'string' && raw.fileName.trim() ? raw.fileName.trim() : `Subtitle_${idx + 1}.${format}`,
     fileSize: typeof raw.fileSize === 'number' ? raw.fileSize : 0,
     sourceFormat: format,
     rawHeader: typeof raw.rawHeader === 'string' ? raw.rawHeader : undefined,
+    rawSourceText: typeof raw.rawSourceText === 'string' ? raw.rawSourceText : undefined,
+    sourceCueSpans: validSpans && validSpans.length === items.length ? validSpans : undefined,
     detectedEncoding: typeof raw.detectedEncoding === 'string' ? raw.detectedEncoding : 'UTF-8',
     subFps: typeof raw.subFps === 'number' ? raw.subFps : 25,
     items,
     status: 'pending',
     createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : Date.now(),
     assignedKeyId: typeof raw.assignedKeyId === 'string' ? raw.assignedKeyId : undefined,
+    timingUpgradedAt: typeof raw.timingUpgradedAt === 'number' ? raw.timingUpgradedAt : undefined,
+    suspectedShiftCuesCount: typeof raw.suspectedShiftCuesCount === 'number' ? raw.suspectedShiftCuesCount : undefined,
   };
   const stats = getFileCompletionStats(sanitizedFile, 'fa');
   sanitizedFile.status = stats.isDone ? 'done' : 'pending';
