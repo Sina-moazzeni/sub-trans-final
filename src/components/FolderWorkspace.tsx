@@ -56,8 +56,9 @@ interface FolderWorkspaceProps {
   onTranslateConcurrentFiles?: (fileIds?: string[]) => void;
   onRetranslateFolder?: (folderId: string) => void;
   onCompleteMissingFolder?: (folderId: string) => void;
-  onUpgradeFolderTiming?: (folderId: string) => void;
-  onUpgradeAllFoldersTiming?: () => void;
+  onAuditAndFixFolder?: (folderId: string) => void;
+  onAuditAndFixAllFolders?: () => void;
+  onCancelOperation?: () => void;
   onResyncFolderTimings?: (folderId: string, files: FileList | File[]) => Promise<void>;
   onBatchExportCompletedFiles?: (folderId: string, format: 'srt' | 'vtt') => void;
   onClearCompletedFilesBatch?: (folderId: string) => void;
@@ -101,8 +102,9 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   onTranslateConcurrentFiles,
   onRetranslateFolder,
   onCompleteMissingFolder,
-  onUpgradeFolderTiming,
-  onUpgradeAllFoldersTiming,
+  onAuditAndFixFolder,
+  onAuditAndFixAllFolders,
+  onCancelOperation,
   onResyncFolderTimings,
   onBatchExportCompletedFiles,
   onClearCompletedFilesBatch,
@@ -179,6 +181,75 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
     if (ids.length === 0) return [];
     const idSet = new Set(ids);
     return folder.files.filter((fl) => idSet.has(fl.id));
+  };
+
+  const getFolderAuditStats = (folder: SubtitleFolder) => {
+    const totalFiles = folder.files.length;
+    const verifiedCount = folder.files.filter((fl) => fl.textAuditStatus === 'verified').length;
+    const uncheckedCount = Math.max(0, totalFiles - verifiedCount);
+    const totalFixedLines = folder.files.reduce((acc, fl) => acc + (fl.textAuditFixedCount || 0), 0);
+    const isRunning = folder.files.some((fl) => isFileCurrentlyTranslating(fl.id));
+    return {
+      totalFiles,
+      verifiedCount,
+      uncheckedCount,
+      allVerified: totalFiles > 0 && verifiedCount === totalFiles,
+      totalFixedLines,
+      isRunning,
+    };
+  };
+
+  const renderFileAuditBadge = (file: SubtitleFolderFile, isRunning: boolean, translatedCount: number) => {
+    if (isRunning) {
+      return (
+        <span className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35 shrink-0">
+          <Loader2 className="w-2.5 h-2.5 animate-spin" />
+          <span>{isEn ? 'Checking...' : 'در حال بررسی...'}</span>
+        </span>
+      );
+    }
+    if (file.textAuditStatus === 'verified') {
+      const fixedCnt = file.textAuditFixedCount || 0;
+      return (
+        <span
+          className="inline-flex items-center gap-1 text-[9px] font-bold px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/40 shrink-0"
+          title={
+            isEn
+              ? `Timing & text alignment verified${fixedCnt > 0 ? ` (${fixedCnt} shifted/missing line(s) fixed)` : ' (100% aligned)'}`
+              : `تایم‌بندی و تطابق متن این فایل بررسی و تایید شده است${fixedCnt > 0 ? ` (${fixedCnt} خط جابه‌جا/ناقص اصلاح شد)` : ' (کاملاً هماهنگ)'}`
+          }
+        >
+          <CheckCircle2 className="w-2.5 h-2.5" />
+          <span>
+            {isEn
+              ? (fixedCnt > 0 ? `Checked ✓ (${fixedCnt} fixed)` : 'Timing & Text ✓')
+              : (fixedCnt > 0 ? `تایم و متن ✓ (${fixedCnt} اصلاح)` : 'تایم و متن ✓')}
+          </span>
+        </span>
+      );
+    }
+    if ((file.suspectedShiftCuesCount || 0) > 0) {
+      return (
+        <span
+          className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35 shrink-0"
+          title={isEn ? 'Possible legacy text shift detected — click Check Timing & Text' : 'احتمال جابه‌جایی متن دیده شد — دکمه بررسی تایم‌بندی و متن را بزنید'}
+        >
+          <AlertCircle className="w-2.5 h-2.5" />
+          <span>{isEn ? 'Needs Check' : 'نیاز به بررسی متن'}</span>
+        </span>
+      );
+    }
+    if (translatedCount > 0) {
+      return (
+        <span
+          className="inline-flex items-center gap-0.5 text-[9px] font-semibold px-1.5 py-0.5 rounded bg-slate-200/80 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border border-slate-300/70 dark:border-slate-700 shrink-0"
+          title={isEn ? 'Text alignment not audited yet' : 'متن هنوز بررسی نشده است'}
+        >
+          <span>{isEn ? 'Unchecked' : 'بررسی نشده'}</span>
+        </span>
+      );
+    }
+    return null;
   };
 
   const handleCreateSubmit = (e: React.FormEvent) => {
@@ -260,6 +331,7 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
   // ============================================================================
   if (inTranslationView && activeFolder) {
     const stats = getFolderStats(activeFolder);
+    const auditStats = getFolderAuditStats(activeFolder);
     const completedBatchFiles = getCompletedBatchFiles(activeFolder);
     const completedBatchIdSet = new Set(completedBatchFiles.map((f) => f.id));
     const allSelected = activeFolder.files.length > 0 && activeFolder.files.every((f) => selectedFileIds.includes(f.id));
@@ -295,6 +367,22 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                   {stats.isDone && <CheckCircle2 className="w-3 h-3" />}
                   <span>{stats.translatedLines}/{stats.totalLines} ({stats.pct}%)</span>
                 </span>
+                {auditStats.totalFiles > 0 && (
+                  <span className={`inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full border ${
+                    auditStats.allVerified
+                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/35'
+                      : auditStats.verifiedCount > 0
+                        ? 'bg-teal-500/10 text-teal-700 dark:text-teal-300 border-teal-500/30'
+                        : 'bg-slate-200/70 dark:bg-slate-800 text-slate-600 dark:text-slate-400 border-slate-300 dark:border-slate-700'
+                  }`}>
+                    <ShieldCheck className="w-3 h-3" />
+                    <span>
+                      {isEn
+                        ? `Verified: ${auditStats.verifiedCount}/${auditStats.totalFiles}`
+                        : `بررسی تایم و متن: ${auditStats.verifiedCount}/${auditStats.totalFiles}`}
+                    </span>
+                  </span>
+                )}
                 {stats.missingLines > 0 && (
                   <span className="inline-flex items-center gap-1 text-[10px] font-bold px-2 py-0.5 rounded-full bg-rose-500/10 text-rose-700 dark:text-rose-300 border border-rose-500/25">
                     <AlertCircle className="w-3 h-3" />
@@ -440,16 +528,42 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 </button>
               )}
 
-              {onUpgradeFolderTiming && (
+              {onAuditAndFixFolder && (
                 <button
                   type="button"
-                  onClick={() => onUpgradeFolderTiming(activeFolder.id)}
+                  onClick={() => onAuditAndFixFolder(activeFolder.id)}
                   disabled={isTranslating || activeFolder.files.length === 0}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold text-teal-800 dark:text-teal-200 bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 dark:hover:bg-teal-900/60 border border-teal-300 dark:border-teal-700 disabled:opacity-45 transition-all active:scale-95 shrink-0"
-                  title={isEn ? 'Instantly upgrade this folder to the new zero-drift timing engine without re-translating (0 tokens)' : 'اصلاح و ارتقای فوری تایم‌بندی همه فایل‌های این پوشه به متد جدید بدون ترجمه مجدد'}
+                  className={`flex items-center justify-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold border shadow-sm disabled:opacity-45 transition-all active:scale-95 shrink-0 ${
+                    auditStats.allVerified
+                      ? 'bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/50 dark:hover:bg-emerald-900/60 text-emerald-800 dark:text-emerald-200 border-emerald-400/60 dark:border-emerald-700'
+                      : 'text-white bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-500 hover:to-cyan-500 border-teal-400/30 shadow-teal-600/20'
+                  }`}
+                  title={
+                    isEn
+                      ? 'Check & fix BOTH exact timing AND text-to-cue alignment for this folder without re-translating from scratch'
+                      : 'بررسی و اصلاح همزمان تایم‌بندی دقیق و جابه‌جایی متن همه فایل‌های این پوشه بدون ترجمه مجدد از صفر'
+                  }
                 >
-                  <ShieldCheck className="w-3.5 h-3.5" />
-                  <span>{isEn ? 'Apply New Timing (0 Tokens)' : 'اصلاح تایم‌بندی پوشه (جدید)'}</span>
+                  {auditStats.isRunning ? (
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  ) : auditStats.allVerified ? (
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
+                  ) : (
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                  )}
+                  <span>
+                    {auditStats.isRunning
+                      ? (isEn ? 'Checking Timing & Text...' : 'در حال بررسی تایم و متن...')
+                      : auditStats.allVerified
+                        ? (isEn
+                            ? `Timing & Text ✓ (${auditStats.verifiedCount}/${auditStats.totalFiles})`
+                            : `تایم‌بندی و متن ✓ (${auditStats.verifiedCount}/${auditStats.totalFiles})`)
+                        : auditStats.verifiedCount > 0
+                          ? (isEn
+                              ? `Resume Timing & Text (${auditStats.verifiedCount}/${auditStats.totalFiles})`
+                              : `ادامه بررسی تایم‌بندی و متن (${auditStats.verifiedCount}/${auditStats.totalFiles})`)
+                          : (isEn ? 'Check Timing & Text' : 'بررسی تایم‌بندی و متن پوشه')}
+                  </span>
                 </button>
               )}
 
@@ -648,7 +762,7 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                             {isEn ? 'Fixed' : 'تکمیل‌شده'}
                           </span>
                         )}
-                        {Boolean(file.rawSourceText && file.sourceCueSpans && file.sourceCueSpans.length === file.items.length) ? (
+                        {Boolean(file.rawSourceText && file.sourceCueSpans && file.sourceCueSpans.length === file.items.length) && (
                           <span
                             className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-700 dark:text-cyan-300 border border-cyan-500/30 shrink-0"
                             title={isEn ? 'Lossless 1:1 original timestamp template locked' : 'الگوی تایم‌بندی اصلی ۱:۱ بدون تغییر قفل شده است'}
@@ -656,24 +770,8 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                             <ShieldCheck className="w-2.5 h-2.5" />
                             <span>1:1</span>
                           </span>
-                        ) : file.timingUpgradedAt ? (
-                          <span
-                            className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-700 dark:text-teal-300 border border-teal-500/30 shrink-0"
-                            title={isEn ? 'Upgraded to new zero-drift timing engine' : 'به موتور تایم‌بندی جدید (دقت صفر میلی‌ثانیه) ارتقا یافت'}
-                          >
-                            <ShieldCheck className="w-2.5 h-2.5" />
-                            <span>{isEn ? 'Synced' : 'تایم‌بندی جدید'}</span>
-                          </span>
-                        ) : null}
-                        {(file.suspectedShiftCuesCount || 0) > 0 && (
-                          <span
-                            className="inline-flex items-center gap-0.5 text-[9px] font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35 shrink-0"
-                            title={isEn ? 'Possible legacy AI text shift detected on adjacent cues' : 'احتمال جابه‌جایی متن بین خطوط در ترجمه قدیمی شناسایی شد'}
-                          >
-                            <AlertCircle className="w-2.5 h-2.5" />
-                            <span>{isEn ? 'Shift?' : 'بررسی متن'}</span>
-                          </span>
                         )}
+                        {renderFileAuditBadge(file, isCurrentlyTranslatingFile, fStats.translated)}
                       </div>
                       <div className="flex items-center gap-1.5 text-[10px] text-slate-500 dark:text-slate-400 mt-0.5 flex-wrap">
                         <span className="uppercase font-mono font-bold text-indigo-600 dark:text-indigo-400">
@@ -864,18 +962,64 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 <span>{isEn ? 'Step 1: Project Folders' : 'مرحله ۱: پوشه‌های پروژه'}</span>
               </h3>
               <div className="flex items-center gap-1.5 flex-wrap">
-                {onUpgradeAllFoldersTiming && folders.some((f) => f.files.length > 0) && (
-                  <button
-                    type="button"
-                    onClick={onUpgradeAllFoldersTiming}
-                    disabled={isTranslating}
-                    className="flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 dark:hover:bg-teal-900/60 text-teal-700 dark:text-teal-300 border border-teal-300 dark:border-teal-700 disabled:opacity-45 transition-colors"
-                    title={isEn ? 'Upgrade ALL saved folders to the new zero-drift timing engine in 1 click (0 tokens, no re-translation)' : 'اصلاح و ارتقای تایم‌بندی همه پوشه‌های ذخیره‌شده به متد جدید با یک کلیک بدون ترجمه مجدد'}
-                  >
-                    <ShieldCheck className="w-3.5 h-3.5" />
-                    <span>{isEn ? 'Fix All Timings' : 'اصلاح تایم‌بندی همه پوشه‌ها'}</span>
-                  </button>
-                )}
+                {onAuditAndFixAllFolders && folders.some((f) => f.files.length > 0) && (() => {
+                  const totalAllFiles = folders.reduce((acc, f) => acc + f.files.length, 0);
+                  const verifiedAllFiles = folders.reduce(
+                    (acc, f) => acc + f.files.filter((fl) => fl.textAuditStatus === 'verified').length,
+                    0
+                  );
+                  const remainingAllFiles = Math.max(0, totalAllFiles - verifiedAllFiles);
+                  const allDone = totalAllFiles > 0 && remainingAllFiles === 0;
+                  return (
+                    <>
+                      <button
+                        type="button"
+                        onClick={onAuditAndFixAllFolders}
+                        disabled={isTranslating}
+                        className={`flex items-center gap-1 px-2.5 py-1 rounded-lg text-[11px] font-bold border disabled:opacity-45 transition-colors ${
+                          allDone
+                            ? 'bg-emerald-50 hover:bg-emerald-100 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border-emerald-400/60 dark:border-emerald-700'
+                            : 'bg-gradient-to-r from-teal-600 to-cyan-600 hover:from-teal-500 hover:to-cyan-500 text-white border-teal-400/30 shadow-xs'
+                        }`}
+                        title={
+                          isEn
+                            ? 'Check & fix BOTH timing and text alignment across ALL folders (skips already-verified files automatically)'
+                            : 'بررسی و اصلاح همزمان تایم‌بندی و متن همه پوشه‌ها (فایل‌های تیک‌خورده را رد می‌کند و فقط باقی‌مانده‌ها را بررسی می‌کند)'
+                        }
+                      >
+                        {isTranslating ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : allDone ? (
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                        ) : (
+                          <ShieldCheck className="w-3.5 h-3.5" />
+                        )}
+                        <span>
+                          {allDone
+                            ? (isEn ? `All Checked ✓ (${totalAllFiles})` : `همه بررسی شد ✓ (${totalAllFiles})`)
+                            : verifiedAllFiles > 0
+                              ? (isEn
+                                  ? `Resume All (${remainingAllFiles} left)`
+                                  : `ادامه بررسی همه (${remainingAllFiles} فایل)`)
+                              : (isEn
+                                  ? `Check Timing & Text All (${totalAllFiles})`
+                                  : `بررسی تایم‌بندی و متن همه (${totalAllFiles} فایل)`)}
+                        </span>
+                      </button>
+                      {isTranslating && onCancelOperation && (
+                        <button
+                          type="button"
+                          onClick={onCancelOperation}
+                          className="flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-bold bg-rose-600 hover:bg-rose-500 text-white transition-colors"
+                          title={isEn ? 'Stop current operation (verified files remain saved)' : 'توقف عملیات (فایل‌های بررسی‌شده ذخیره می‌مانند)'}
+                        >
+                          <X className="w-3 h-3" />
+                          <span>{isEn ? 'Stop' : 'توقف'}</span>
+                        </button>
+                      )}
+                    </>
+                  );
+                })()}
                 <button
                   type="button"
                   onClick={() => dirInputRef.current?.click()}
@@ -931,6 +1075,7 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                 folders.map((folder) => {
                   const isSelected = activeFolder?.id === folder.id;
                   const fStats = getFolderStats(folder);
+                  const fAudit = getFolderAuditStats(folder);
                   const folderCompletedBatch = getCompletedBatchFiles(folder);
                   const isEditing = editingFolderId === folder.id;
 
@@ -1026,6 +1171,16 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                                     </span>
                                   </>
                                 )}
+                                {fAudit.verifiedCount > 0 && (
+                                  <>
+                                    <span>•</span>
+                                    <span className="text-emerald-600 dark:text-emerald-400 font-bold">
+                                      {isEn
+                                        ? `Checked ${fAudit.verifiedCount}/${fAudit.totalFiles} ✓`
+                                        : `بررسی شده ${fAudit.verifiedCount}/${fAudit.totalFiles} ✓`}
+                                    </span>
+                                  </>
+                                )}
                               </div>
                             </div>
                           )}
@@ -1080,30 +1235,50 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
                         )}
                       </div>
 
-                      {/* Quick Timing Upgrade + Direct VTT/SRT Export Strip on EVERY Folder Card */}
+                      {/* Merged Timing + Text Alignment Check + Direct VTT/SRT Export Strip on EVERY Folder Card */}
                       {!isEditing && folder.files.length > 0 && (
                         <div
                           className="flex items-center justify-between gap-2 pt-2 border-t border-slate-200/80 dark:border-slate-800/80 text-[10px] flex-wrap"
                           onClick={(e) => e.stopPropagation()}
                         >
                           <div className="flex items-center gap-1.5">
-                            {onUpgradeFolderTiming && (
+                            {onAuditAndFixFolder && (
                               <button
                                 type="button"
-                                onClick={() => onUpgradeFolderTiming(folder.id)}
+                                onClick={() => onAuditAndFixFolder(folder.id)}
                                 disabled={isTranslating}
-                                className={`inline-flex items-center gap-1 px-2 py-1 rounded-md font-bold border transition-colors disabled:opacity-40 ${
-                                  folder.files.every((fl) => Boolean(fl.timingUpgradedAt))
-                                    ? 'bg-teal-500/15 text-teal-700 dark:text-teal-300 border-teal-500/35 hover:bg-teal-500/25'
-                                    : 'bg-cyan-50 hover:bg-cyan-100 dark:bg-cyan-950/50 dark:hover:bg-cyan-900/60 text-cyan-700 dark:text-cyan-300 border-cyan-300 dark:border-cyan-700'
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md font-bold border transition-colors disabled:opacity-45 ${
+                                  fAudit.isRunning
+                                    ? 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border-amber-500/40'
+                                    : fAudit.allVerified
+                                      ? 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border-emerald-500/40 hover:bg-emerald-500/25'
+                                      : 'bg-teal-50 hover:bg-teal-100 dark:bg-teal-950/50 dark:hover:bg-teal-900/60 text-teal-800 dark:text-teal-200 border-teal-400/70 dark:border-teal-700'
                                 }`}
-                                title={isEn ? 'Fix & lock timings with new engine (0 tokens, no re-translation)' : 'اصلاح تایم‌بندی این پوشه با متد جدید بدون ترجمه مجدد'}
+                                title={
+                                  isEn
+                                    ? 'Check & fix BOTH timing and text alignment for all files in this folder without re-translating from scratch'
+                                    : 'بررسی و اصلاح همزمان تایم‌بندی و تطابق متن این پوشه بدون ترجمه مجدد از صفر (با ثبت تیک بررسی روی هر فایل)'
+                                }
                               >
-                                <ShieldCheck className="w-3 h-3" />
+                                {fAudit.isRunning ? (
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                ) : fAudit.allVerified ? (
+                                  <CheckCircle2 className="w-3 h-3" />
+                                ) : (
+                                  <ShieldCheck className="w-3 h-3" />
+                                )}
                                 <span>
-                                  {folder.files.every((fl) => Boolean(fl.timingUpgradedAt))
-                                    ? (isEn ? 'New Timing ✓' : 'تایم‌بندی جدید ✓')
-                                    : (isEn ? 'Fix Timing' : 'اصلاح تایم‌بندی')}
+                                  {fAudit.isRunning
+                                    ? (isEn ? 'Checking...' : 'در حال بررسی...')
+                                    : fAudit.allVerified
+                                      ? (isEn
+                                          ? `Timing & Text ✓ (${fAudit.verifiedCount}/${fAudit.totalFiles})`
+                                          : `تایم‌بندی و متن ✓ (${fAudit.verifiedCount}/${fAudit.totalFiles})`)
+                                      : fAudit.verifiedCount > 0
+                                        ? (isEn
+                                            ? `Resume Check (${fAudit.verifiedCount}/${fAudit.totalFiles})`
+                                            : `ادامه بررسی (${fAudit.verifiedCount}/${fAudit.totalFiles})`)
+                                        : (isEn ? 'Check Timing & Text' : 'بررسی تایم‌بندی و متن')}
                                 </span>
                               </button>
                             )}
@@ -1245,25 +1420,37 @@ export const FolderWorkspace: React.FC<FolderWorkspaceProps> = ({
               <div className="flex flex-col gap-2 max-h-56 overflow-y-auto pr-1">
                 {activeFolder.files.map((file, idx) => {
                   const fStats = getFileStats(file);
+                  const isRunningFile = isFileCurrentlyTranslating(file.id);
                   return (
                     <div
                       key={file.id}
-                      className="flex items-center justify-between gap-2 p-2.5 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800"
+                      className={`flex items-center justify-between gap-2 p-2.5 rounded-xl border transition-colors ${
+                        isRunningFile
+                          ? 'bg-amber-50/70 dark:bg-amber-950/25 border-amber-400 dark:border-amber-600'
+                          : file.textAuditStatus === 'verified'
+                            ? 'bg-emerald-50/35 dark:bg-emerald-950/15 border-emerald-400/50 dark:border-emerald-800/70'
+                            : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800'
+                      }`}
                     >
                       <div className="flex items-center gap-2.5 min-w-0 flex-1">
                         <span className="text-[10px] font-mono font-bold text-slate-400 w-5 text-center shrink-0">
                           {idx + 1}
                         </span>
-                        {fStats.isDone ? (
+                        {isRunningFile ? (
+                          <Loader2 className="w-4 h-4 text-amber-500 animate-spin shrink-0" />
+                        ) : fStats.isDone ? (
                           <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
                         ) : (
                           <FileText className="w-4 h-4 text-indigo-500 shrink-0" />
                         )}
                         <div className="min-w-0 flex-1">
-                          <div className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate font-mono">
-                            {file.fileName}
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <div className="text-xs font-bold text-slate-800 dark:text-slate-100 truncate font-mono">
+                              {file.fileName}
+                            </div>
+                            {renderFileAuditBadge(file, isRunningFile, fStats.translated)}
                           </div>
-                          <div className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 flex-wrap">
+                          <div className="flex items-center gap-2 text-[10px] text-slate-500 dark:text-slate-400 flex-wrap mt-0.5">
                             <span className="uppercase font-mono font-bold text-indigo-600 dark:text-indigo-400">
                               .{file.sourceFormat}
                             </span>

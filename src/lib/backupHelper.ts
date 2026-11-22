@@ -89,6 +89,9 @@ function sanitizeFolderFile(raw: any, idx: number): SubtitleFolderFile | null {
     assignedKeyId: typeof raw.assignedKeyId === 'string' ? raw.assignedKeyId : undefined,
     timingUpgradedAt: typeof raw.timingUpgradedAt === 'number' ? raw.timingUpgradedAt : undefined,
     suspectedShiftCuesCount: typeof raw.suspectedShiftCuesCount === 'number' ? raw.suspectedShiftCuesCount : undefined,
+    textAuditStatus: raw.textAuditStatus === 'verified' ? 'verified' : undefined,
+    textAuditCheckedAt: typeof raw.textAuditCheckedAt === 'number' ? raw.textAuditCheckedAt : undefined,
+    textAuditFixedCount: typeof raw.textAuditFixedCount === 'number' ? raw.textAuditFixedCount : undefined,
   };
   const stats = getFileCompletionStats(sanitizedFile, 'fa');
   sanitizedFile.status = stats.isDone ? 'done' : 'pending';

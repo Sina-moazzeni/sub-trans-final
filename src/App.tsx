@@ -3376,84 +3376,541 @@ export default function App() {
     );
   };
 
-  // Zero-Token 1-Click Timing Upgrade for ANY Existing Translated Folder (NO Re-Translation!)
-  const handleUpgradeFolderTiming = (folderId: string) => {
-    const folder = foldersRef.current.find((f) => f.id === folderId);
-    if (!folder || folder.files.length === 0) {
-      showToast(uiLang === 'en' ? 'No files in folder to upgrade.' : 'فایلی در این پوشه وجود ندارد.', 'warning');
-      return;
+  // Shared cancel handler for active translation OR timing+text audit jobs
+  const handleCancelActiveJob = () => {
+    cancelTranslationRef.current = true;
+    isTranslatingRef.current = false;
+    activeJobIdRef.current = '';
+    if (activeAbortControllerRef.current) {
+      try { activeAbortControllerRef.current.abort(); } catch {}
+      activeAbortControllerRef.current = null;
     }
-
-    const report = upgradeFolderWithNewTimingEngine(folder, targetLanguage, appendRTLMarkers);
-    foldersRef.current = foldersRef.current.map((f) => (f.id === folderId ? report.folder : f));
-    setFolders(foldersRef.current);
-    void saveFolderToDb(report.folder);
-
-    if (activeFolderIdRef.current === folderId && activeFileIdRef.current) {
-      const updatedActiveFile = report.folder.files.find((fl) => fl.id === activeFileIdRef.current) || null;
-      if (updatedActiveFile) {
-        loadFolderFileIntoEditor(updatedActiveFile);
-      }
-    }
-
-    const shiftWarningFa = report.filesWithSuspectedTextShift.length > 0
-      ? ` (هشدار: در ${report.filesWithSuspectedTextShift.length} فایل احتمال جابه‌جایی متن از ترجمه قدیمی دیده شد)`
-      : '';
-    const shiftWarningEn = report.filesWithSuspectedTextShift.length > 0
-      ? ` (Note: ${report.filesWithSuspectedTextShift.length} file(s) show suspected legacy text shift)`
-      : '';
-
-    showToast(
-      uiLang === 'en'
-        ? `Folder "${folder.name}" upgraded to new zero-drift timing engine (${report.filesProcessed} files, ${report.totalFixedTimestamps} timestamps locked, ${report.totalSanitizedPayloads} payloads cleaned, 0 tokens). Ready to download!${shiftWarningEn}`
-        : `تایم‌بندی پوشه «${folder.name}» با متد جدید اصلاح و قفل شد (${report.filesProcessed} فایل، ${report.totalFixedTimestamps} تایم‌کد استاندارد، ${report.totalSanitizedPayloads} خط پاکسازی‌شده — بدون ترجمه مجدد). آماده دانلود!${shiftWarningFa}`,
-      report.filesWithSuspectedTextShift.length > 0 ? 'warning' : 'success'
-    );
+    folderAbortControllersRef.current.forEach((ctrl) => {
+      try { ctrl.abort(); } catch {}
+    });
+    folderAbortControllersRef.current.clear();
+    translatingFileIdsRef.current = [];
+    setTranslatingFileIds([]);
+    setFileKeyUsageMap({});
+    setTranslatingFileId(null);
+    setProgressTotalLines(null);
+    setPacingRemainingSec(null);
+    setRetryInfo(null);
+    setIsTranslating(false);
   };
 
-  // Zero-Token 1-Click Timing Upgrade for ALL Saved Folders at Once!
-  const handleUpgradeAllFoldersTiming = () => {
-    const allFolders = foldersRef.current;
-    if (allFolders.length === 0) {
-      showToast(uiLang === 'en' ? 'No folders found.' : 'هیچ پوشه‌ای یافت نشد.', 'warning');
+  // Unified 1-Click Timing Lock + Diff-Only Text Alignment Audit for 1 or ALL Folders (NO Re-Translation from Scratch!)
+  // Stage 1 (Instant, 0 tokens): Locks exact integer-ms ASCII timestamps, strips orphan headers & echoed timestamps.
+  // Stage 2 (Fast Diff-Only AI Audit): Scans 35-line overlapping windows via /api/realign-subtitles, fixes ONLY
+  //         shifted/merged/missing lines, preserves good translations, and stamps green verified checkmarks per file.
+  const handleAuditAndFixFolders = async (
+    targetFolderIds: string[],
+    options?: { forceRecheck?: boolean }
+  ) => {
+    if (isTranslatingRef.current) {
+      showToast(
+        uiLang === 'en'
+          ? 'Another translation or audit job is currently running. Stop it first or wait for completion.'
+          : 'یک عملیات ترجمه یا بررسی در حال اجرا است. ابتدا صبر کنید یا آن را متوقف نمایید.',
+        'info'
+      );
       return;
     }
 
-    let totalFiles = 0;
-    let totalFixedTimestamps = 0;
-    let totalSanitizedPayloads = 0;
-    let totalRemovedOrphans = 0;
-    let totalSuspectedShiftFiles = 0;
+    const validFolderIds = targetFolderIds.filter((fid) => {
+      const f = foldersRef.current.find((fld) => fld.id === fid);
+      return Boolean(f && f.files.length > 0);
+    });
 
-    const upgradedFolders = allFolders.map((folder) => {
-      if (folder.files.length === 0) return folder;
-      const report = upgradeFolderWithNewTimingEngine(folder, targetLanguage, appendRTLMarkers);
-      totalFiles += report.filesProcessed;
-      totalFixedTimestamps += report.totalFixedTimestamps;
-      totalSanitizedPayloads += report.totalSanitizedPayloads;
-      totalRemovedOrphans += report.totalRemovedOrphanHeaders;
-      totalSuspectedShiftFiles += report.filesWithSuspectedTextShift.length;
+    if (validFolderIds.length === 0) {
+      showToast(
+        uiLang === 'en' ? 'No folders with subtitle files found.' : 'هیچ پوشه‌ای دارای فایل زیرنویس یافت نشد.',
+        'warning'
+      );
+      return;
+    }
+
+    const effectiveTargetLang = targetLanguage || 'fa';
+    const isRTL = RTL_LANGUAGES.includes(effectiveTargetLang);
+
+    // =========================================================================
+    // STAGE 1: INSTANT ZERO-TOKEN TIMING UPGRADE & LOCK ON ALL TARGET FOLDERS
+    // =========================================================================
+    let stage1FilesTotal = 0;
+    let stage1FixedTimestamps = 0;
+    let stage1SanitizedPayloads = 0;
+    let stage1RemovedOrphans = 0;
+
+    const targetIdSet = new Set(validFolderIds);
+    const stage1Folders = foldersRef.current.map((folder) => {
+      if (!targetIdSet.has(folder.id) || folder.files.length === 0) return folder;
+      const report = upgradeFolderWithNewTimingEngine(folder, effectiveTargetLang, appendRTLMarkers);
+      stage1FilesTotal += report.filesProcessed;
+      stage1FixedTimestamps += report.totalFixedTimestamps;
+      stage1SanitizedPayloads += report.totalSanitizedPayloads;
+      stage1RemovedOrphans += report.totalRemovedOrphanHeaders;
       void saveFolderToDb(report.folder);
       return report.folder;
     });
 
-    foldersRef.current = upgradedFolders;
-    setFolders(upgradedFolders);
+    foldersRef.current = stage1Folders;
+    setFolders(stage1Folders);
 
     if (activeFolderIdRef.current && activeFileIdRef.current) {
-      const curFolder = upgradedFolders.find((f) => f.id === activeFolderIdRef.current);
+      const curFolder = stage1Folders.find((f) => f.id === activeFolderIdRef.current);
       const curFile = curFolder?.files.find((fl) => fl.id === activeFileIdRef.current) || null;
       if (curFile) {
         loadFolderFileIntoEditor(curFile);
       }
     }
 
+    // Check AI credentials before Stage 2 (Diff-Only Text Alignment Audit)
+    const hasCustomReady =
+      activeAiProvider === 'custom' &&
+      Boolean(customProviderConfig.baseUrl?.trim() && customProviderConfig.model?.trim());
+    const hasGeminiReady =
+      activeAiProvider !== 'custom' &&
+      (getOrderedHealthyKeys().length > 0 || serverHasKey);
+
+    if (!hasCustomReady && !hasGeminiReady) {
+      showToast(
+        uiLang === 'en'
+          ? `Timing locked on ${stage1FilesTotal} file(s) (${stage1FixedTimestamps} timestamps, 0 tokens). Add an API key to run text-alignment verification.`
+          : `تایم‌بندی ${stage1FilesTotal} فایل فوراً اصلاح و قفل شد (${stage1FixedTimestamps} تایم‌کد، بدون توکن). برای بررسی و اصلاح جابه‌جایی متن فایل‌ها ابتدا یک کلید API اضافه کنید.`,
+        'warning'
+      );
+      setIsApiKeyModalOpen(true);
+      return;
+    }
+
+    // Build queue of files needing text-alignment audit
+    // Skip files already verified so large libraries resume instantly; if user clicks a single
+    // already-verified folder explicitly, allow re-checking that folder.
+    const isSingleFolderRun = validFolderIds.length === 1;
+    const allCandidateEntries: Array<{ folderId: string; file: SubtitleFolderFile }> = [];
+    for (const fid of validFolderIds) {
+      const fld = foldersRef.current.find((f) => f.id === fid);
+      if (!fld) continue;
+      for (const fl of fld.files) {
+        if (fl.items.length > 0) {
+          allCandidateEntries.push({ folderId: fld.id, file: fl });
+        }
+      }
+    }
+
+    let queue = options?.forceRecheck
+      ? allCandidateEntries
+      : allCandidateEntries.filter((entry) => entry.file.textAuditStatus !== 'verified');
+
+    if (queue.length === 0) {
+      if (isSingleFolderRun && allCandidateEntries.length > 0) {
+        // User explicitly clicked a single already-verified folder -> re-verify all files in it
+        queue = allCandidateEntries;
+      } else {
+        showToast(
+          uiLang === 'en'
+            ? `All ${stage1FilesTotal} file(s) are already timing-locked and text-verified! Click a specific folder button to re-audit it.`
+            : `تایم‌بندی و متن همه ${stage1FilesTotal} فایل قبلاً بررسی و تیک خورده است! (برای بررسی مجدد روی دکمه همان پوشه کلیک کنید)`,
+          'success'
+        );
+        return;
+      }
+    }
+
+    // =========================================================================
+    // STAGE 2: HIGH-SPEED DIFF-ONLY TEXT ALIGNMENT AUDIT (/api/realign-subtitles)
+    // =========================================================================
+    const WINDOW_SIZE = 35;
+    const WINDOW_STRIDE = 32; // 3-line overlap catches shifts crossing window boundaries!
+
+    const buildWindowRanges = (totalItems: number): Array<{ start: number; end: number }> => {
+      if (totalItems <= 0) return [];
+      if (totalItems <= WINDOW_SIZE) return [{ start: 0, end: totalItems }];
+      const ranges: Array<{ start: number; end: number }> = [];
+      let start = 0;
+      while (start < totalItems) {
+        const end = Math.min(totalItems, start + WINDOW_SIZE);
+        ranges.push({ start, end });
+        if (end >= totalItems) break;
+        start += WINDOW_STRIDE;
+      }
+      return ranges;
+    };
+
+    const effectiveModel = resolveModelId(selectedModel);
+    const totalLinesAcrossQueue = queue.reduce((acc, e) => acc + e.file.items.length, 0);
+    const totalWindowsAcrossQueue = queue.reduce(
+      (acc, e) => acc + buildWindowRanges(e.file.items.length).length,
+      0
+    );
+
+    const currentJobId = `audit_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    activeJobIdRef.current = currentJobId;
+    cancelTranslationRef.current = false;
+    isTranslatingRef.current = true;
+    setIsTranslating(true);
+    setIsPaused(false);
+    isPausedRef.current = false;
+    setRetryInfo(null);
+    setPacingRemainingSec(null);
+    setProgressTotalLines(totalLinesAcrossQueue);
+    setTotalBatches(Math.max(1, totalWindowsAcrossQueue));
+    setCurrentBatch(0);
+    setTranslatedCount(0);
+    setActiveRunningModel(
+      activeAiProvider === 'custom'
+        ? customProviderConfig.model || 'Custom Model'
+        : effectiveModel
+    );
+    setIsFallbackActive(false);
+
     showToast(
       uiLang === 'en'
-        ? `Upgraded ALL ${upgradedFolders.length} folders (${totalFiles} files, ${totalFixedTimestamps} timestamps locked, ${totalSanitizedPayloads} payloads cleaned${totalRemovedOrphans > 0 ? `, ${totalRemovedOrphans} broken headers fixed` : ''}) with 0 tokens!${totalSuspectedShiftFiles > 0 ? ` (${totalSuspectedShiftFiles} file(s) flagged for possible legacy AI text shift)` : ''}`
-        : `تایم‌بندی همه ${upgradedFolders.length} پوشه (${totalFiles} فایل) یکجا با متد جدید اصلاح و قفل شد (${totalFixedTimestamps} تایم‌کد، ${totalSanitizedPayloads} خط پاکسازی‌شده${totalRemovedOrphans > 0 ? `، ${totalRemovedOrphans} هدر خراب اصلاح‌شده` : ''}) — بدون ترجمه مجدد!${totalSuspectedShiftFiles > 0 ? ` (${totalSuspectedShiftFiles} فایل با هشدار احتمال جابه‌جایی متن قدیمی مشخص شدند)` : ''}`,
-      totalSuspectedShiftFiles > 0 ? 'warning' : 'success'
+        ? `Timing locked (${stage1FixedTimestamps} timestamps). Starting fast text-alignment check on ${queue.length} file(s)...`
+        : `تایم‌بندی قفل شد (${stage1FixedTimestamps} تایم‌کد${stage1RemovedOrphans > 0 ? `، ${stage1RemovedOrphans} هدر اصلاح‌شده` : ''}). شروع بررسی هوشمند متن روی ${queue.length} فایل (بدون ترجمه مجدد)...`,
+      'info'
     );
+
+    const releaseKeepAlive = acquireTranslationKeepAlive();
+    const workerCount = Math.min(queue.length, Math.max(1, concurrentFilesCount));
+    let nextQueueIndex = 0;
+    let globalWindowCounter = 0;
+    let totalFilesVerified = 0;
+    let totalLinesFixed = 0;
+    let totalFilesWithErrors = 0;
+
+    const markWorkerActiveFile = (fileId: string, active: boolean, keyLabel?: string) => {
+      if (active) {
+        if (!translatingFileIdsRef.current.includes(fileId)) {
+          translatingFileIdsRef.current = [...translatingFileIdsRef.current, fileId];
+          setTranslatingFileIds(translatingFileIdsRef.current);
+        }
+        setTranslatingFileId(translatingFileIdsRef.current[0] || null);
+        if (keyLabel) {
+          setFileKeyUsageMap((prev) => ({ ...prev, [fileId]: keyLabel }));
+        }
+      } else {
+        translatingFileIdsRef.current = translatingFileIdsRef.current.filter((id) => id !== fileId);
+        setTranslatingFileIds(translatingFileIdsRef.current);
+        setTranslatingFileId(translatingFileIdsRef.current[0] || null);
+        setFileKeyUsageMap((prev) => {
+          const copy = { ...prev };
+          delete copy[fileId];
+          return copy;
+        });
+      }
+    };
+
+    const persistFileUpdate = (
+      tFolderId: string,
+      targetFileId: string,
+      updater: (fl: SubtitleFolderFile) => SubtitleFolderFile
+    ) => {
+      const curFolder = foldersRef.current.find((f) => f.id === tFolderId);
+      if (!curFolder) return;
+      let updatedFileRef: SubtitleFolderFile | null = null;
+      const nextFolder: SubtitleFolder = {
+        ...curFolder,
+        updatedAt: Date.now(),
+        files: curFolder.files.map((fl) => {
+          if (fl.id !== targetFileId) return fl;
+          updatedFileRef = updater(fl);
+          return updatedFileRef;
+        }),
+      };
+      foldersRef.current = foldersRef.current.map((f) => (f.id === tFolderId ? nextFolder : f));
+      setFolders(foldersRef.current);
+      if (updatedFileRef && activeFolderIdRef.current === tFolderId && activeFileIdRef.current === targetFileId) {
+        setItems((updatedFileRef as SubtitleFolderFile).items);
+      }
+      void saveFolderToDb(nextFolder);
+    };
+
+    const auditSingleWindowForFile = async (
+      file: SubtitleFolderFile,
+      workerIdx: number,
+      windowItems: SubtitleItem[],
+      windowIdx: number,
+      globalWinNum: number
+    ): Promise<Array<{ id: number; text: string }> | null> => {
+      let attempt = 0;
+      const MAX_RETRIES = 4;
+
+      while (attempt < MAX_RETRIES && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+        attempt++;
+        if (attempt > 1) {
+          setRetryInfo({ batch: globalWinNum, attempt, maxRetries: MAX_RETRIES });
+          const baseDelay = Math.min(Math.pow(2, attempt - 1) * 1800, 15000);
+          const jitter = Math.floor(Math.random() * 800);
+          await backgroundSleep(baseDelay + jitter);
+        }
+
+        if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+        const abortController = new AbortController();
+        const controllerKey = `audit_${file.id}_w${windowIdx}_a${attempt}`;
+        folderAbortControllersRef.current.set(controllerKey, abortController);
+
+        const orderedStoredKeys = activeAiProvider !== 'custom'
+          ? getOrderedHealthyKeys(file.assignedKeyId, workerIdx)
+          : [];
+        const orderedKeyStrings = orderedStoredKeys.map((k) => k.key.trim()).filter(Boolean);
+
+        if (activeAiProvider !== 'custom' && orderedStoredKeys[0]) {
+          setFileKeyUsageMap((prev) => ({ ...prev, [file.id]: orderedStoredKeys[0].label }));
+        }
+
+        try {
+          if (activeAiProvider !== 'custom' && orderedStoredKeys.length > 0) {
+            const primaryKey = orderedStoredKeys[0];
+            await acquireKeyRpmSlot(
+              primaryKey.key,
+              primaryKey.rpmLimit || DEFAULT_KEY_RPM_LIMIT,
+              abortController.signal,
+              (waitSec) => {
+                if (workerCount === 1) setPacingRemainingSec(waitSec);
+              }
+            );
+            if (workerCount === 1) setPacingRemainingSec(null);
+          }
+
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          const reqTimeoutMs = activeAiProvider === 'custom' ? 240_000 : 150_000;
+          const response = await fetchWithBackgroundTimeout(
+            '/api/realign-subtitles',
+            {
+              method: 'POST',
+              headers: getApiHeaders(orderedKeyStrings),
+              body: JSON.stringify({
+                items: windowItems.map((it) => ({
+                  id: it.id,
+                  en: it.originalText || '',
+                  fa: it.translatedText || '',
+                })),
+                targetLanguage: effectiveTargetLang,
+                tone: selectedTone,
+                customPrompt,
+                model: effectiveModel,
+                provider: activeAiProvider,
+                customProvider: activeAiProvider === 'custom' ? customProviderConfig : undefined,
+              }),
+            },
+            abortController.signal,
+            reqTimeoutMs
+          );
+
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          const data = await response.json().catch(() => ({}));
+
+          if (activeAiProvider !== 'custom' && orderedKeyStrings.length > 0) {
+            processGeminiKeyTelemetry(orderedKeyStrings, data);
+          }
+
+          if (!response.ok || (data.success === false && data.error)) {
+            const hasMoreHealthyKeys =
+              activeAiProvider !== 'custom' &&
+              getOrderedHealthyKeys(file.assignedKeyId, workerIdx).length > 0;
+            const isAuthRetryPossible =
+              (response.status === 401 || response.status === 403) && hasMoreHealthyKeys;
+            const isNonRetryable = !isAuthRetryPossible && (
+              data.retryable === false ||
+              response.status === 400 ||
+              response.status === 401 ||
+              response.status === 403 ||
+              response.status === 413
+            );
+            const errorMsg = data.error || `Server error (${response.status}) during alignment check.`;
+            if (isNonRetryable) {
+              showToast(`${file.fileName}: ${errorMsg}`, 'error');
+              cancelTranslationRef.current = true;
+              break;
+            }
+            throw new Error(errorMsg);
+          }
+
+          if (data.modelUsed) setActiveRunningModel(data.modelUsed);
+          setRetryInfo(null);
+          return Array.isArray(data.fixes) ? data.fixes : [];
+        } catch (err: any) {
+          if (err?.name === 'AbortError' || cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) {
+            break;
+          }
+          if (attempt >= MAX_RETRIES) {
+            const errMsg = err instanceof Error ? err.message : `Window ${globalWinNum} failed.`;
+            showToast(`${file.fileName}: ${errMsg}`, 'error');
+          }
+        } finally {
+          folderAbortControllersRef.current.delete(controllerKey);
+        }
+      }
+
+      return null;
+    };
+
+    const runAuditWorker = async (workerIdx: number) => {
+      while (!cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+        const qIdx = nextQueueIndex++;
+        if (qIdx >= queue.length) break;
+
+        const { folderId, file } = queue[qIdx];
+        const initialKeys = activeAiProvider !== 'custom'
+          ? getOrderedHealthyKeys(file.assignedKeyId, workerIdx)
+          : [];
+        const initialKeyLabel = activeAiProvider === 'custom'
+          ? (customProviderConfig.name || customProviderConfig.model || 'Proxy API')
+          : (initialKeys[0]?.label || (serverHasKey ? 'Server Key' : 'Gemini Key'));
+
+        markWorkerActiveFile(file.id, true, initialKeyLabel);
+
+        let workingItems = [...file.items];
+        const windows = buildWindowRanges(workingItems.length);
+        let fileFixedCount = 0;
+        let fileHadError = false;
+        let prevEnd = 0;
+
+        for (let w = 0; w < windows.length; w++) {
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          while (isPausedRef.current) {
+            if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+            await backgroundSleep(400);
+          }
+
+          if (cancelTranslationRef.current || activeJobIdRef.current !== currentJobId) break;
+
+          globalWindowCounter++;
+          const winNum = globalWindowCounter;
+          setCurrentBatch(winNum);
+
+          const { start, end } = windows[w];
+          const windowSlice = workingItems.slice(start, end);
+          const newlyCoveredLines = Math.max(0, end - prevEnd);
+          prevEnd = Math.max(prevEnd, end);
+
+          const fixes = await auditSingleWindowForFile(file, workerIdx, windowSlice, w, winNum);
+
+          if (fixes === null) {
+            fileHadError = true;
+            break;
+          }
+
+          if (fixes.length > 0 && activeJobIdRef.current === currentJobId && !cancelTranslationRef.current) {
+            const nextItems = [...workingItems];
+            let windowApplied = 0;
+            for (const fix of fixes) {
+              const targetIdx = nextItems.findIndex((it) => it.id === fix.id);
+              if (targetIdx !== -1 && typeof fix.text === 'string' && fix.text.trim().length > 0) {
+                let finalText = isRTL ? fixRTLPunctuation(fix.text) : fix.text;
+                if (isRTL && appendRTLMarkers) {
+                  finalText = appendHiddenRTLMarker(finalText);
+                }
+                nextItems[targetIdx] = {
+                  ...nextItems[targetIdx],
+                  startTime: toEnglishDigits(nextItems[targetIdx].startTime),
+                  endTime: toEnglishDigits(nextItems[targetIdx].endTime),
+                  translatedText: finalText,
+                };
+                windowApplied++;
+              }
+            }
+            if (windowApplied > 0) {
+              workingItems = nextItems;
+              fileFixedCount += windowApplied;
+              persistFileUpdate(folderId, file.id, (fl) => ({
+                ...fl,
+                items: workingItems,
+              }));
+            }
+          }
+
+          setTranslatedCount((prev) => prev + newlyCoveredLines);
+
+          if (w < windows.length - 1 && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+            await backgroundSleep(activeAiProvider === 'custom' ? 350 : 400);
+          }
+        }
+
+        if (!fileHadError && !cancelTranslationRef.current && activeJobIdRef.current === currentJobId) {
+          // Final zero-drift timing engine lock on the audited file & stamp green verified checkmark!
+          const latestFileBase: SubtitleFolderFile = {
+            ...file,
+            items: workingItems,
+          };
+          const finalUpgrade = upgradeFileWithNewTimingEngine(
+            latestFileBase,
+            effectiveTargetLang,
+            appendRTLMarkers
+          );
+          const finalStats = getFileCompletionStats(finalUpgrade.file, effectiveTargetLang);
+          const checkedAt = Date.now();
+
+          persistFileUpdate(folderId, file.id, () => ({
+            ...finalUpgrade.file,
+            status: finalStats.isDone ? 'done' : 'pending',
+            timingUpgradedAt: checkedAt,
+            suspectedShiftCuesCount: 0,
+            textAuditStatus: 'verified',
+            textAuditCheckedAt: checkedAt,
+            textAuditFixedCount: fileFixedCount,
+          }));
+
+          totalFilesVerified++;
+          totalLinesFixed += fileFixedCount;
+        } else if (fileHadError) {
+          totalFilesWithErrors++;
+        }
+
+        markWorkerActiveFile(file.id, false);
+      }
+    };
+
+    try {
+      await Promise.all(
+        Array.from({ length: workerCount }, (_, workerIdx) => runAuditWorker(workerIdx))
+      );
+    } finally {
+      releaseKeepAlive();
+      folderAbortControllersRef.current.clear();
+
+      if (activeJobIdRef.current === currentJobId) {
+        translatingFileIdsRef.current = [];
+        setTranslatingFileIds([]);
+        setFileKeyUsageMap({});
+        setTranslatingFileId(null);
+        setPacingRemainingSec(null);
+        setProgressTotalLines(null);
+        setRetryInfo(null);
+        setIsTranslating(false);
+        isTranslatingRef.current = false;
+
+        if (cancelTranslationRef.current) {
+          showToast(
+            uiLang === 'en'
+              ? `Audit stopped. Progress saved for ${totalFilesVerified} verified file(s) (${totalLinesFixed} line(s) fixed). Click again to resume remaining files.`
+              : `بررسی متوقف شد؛ تیک و اصلاحات ${totalFilesVerified} فایل (${totalLinesFixed} خط اصلاح‌شده) ذخیره شد. با کلیک مجدد از ادامه فایل‌های باقی‌مانده ادامه پیدا می‌کند.`,
+            'info'
+          );
+        } else {
+          showToast(
+            uiLang === 'en'
+              ? `Timing & text verified on ${totalFilesVerified} file(s)! Fixed ${totalLinesFixed} shifted/missing line(s) and locked ${stage1FixedTimestamps} timestamps${stage1SanitizedPayloads > 0 ? ` (${stage1SanitizedPayloads} payloads cleaned)` : ''}${totalFilesWithErrors > 0 ? `. ${totalFilesWithErrors} file(s) had errors — click again to retry them.` : '.'}`
+              : `تایم‌بندی و متن ${totalFilesVerified} فایل بررسی و تایید شد! (${totalLinesFixed} خط جابه‌جا/ناقص اصلاح شد و ${stage1FixedTimestamps} تایم‌کد قفل شد — تیک سبز روی فایل‌ها ثبت شد${totalFilesWithErrors > 0 ? `؛ ${totalFilesWithErrors} فایل خطا داشت که با کلیک مجدد ادامه پیدا می‌کند` : ''})`,
+            totalFilesWithErrors > 0 ? 'warning' : 'success'
+          );
+        }
+      }
+    }
+  };
+
+  const handleAuditAndFixFolder = (folderId: string) => {
+    void handleAuditAndFixFolders([folderId]);
+  };
+
+  const handleAuditAndFixAllFolders = () => {
+    const ids = foldersRef.current.filter((f) => f.files.length > 0).map((f) => f.id);
+    void handleAuditAndFixFolders(ids);
   };
 
   // Fast Batch Export Entire Folder in SRT or VTT (.ZIP)
@@ -3591,50 +4048,74 @@ export default function App() {
         
         {/* CINEMA MODE: 3-Step Folder -> Batch Upload -> Default Translation Page */}
         {mode === 'cinema' && !inTranslationView ? (
-          <FolderWorkspace
-            folders={folders}
-            activeFolder={activeFolder}
-            activeFileId={activeFileId}
-            inTranslationView={false}
-            isTranslating={isTranslating}
-            translatingFileId={translatingFileId}
-            translatingFileIds={translatingFileIds}
-            fileKeyUsageMap={fileKeyUsageMap}
-            savedGeminiKeys={savedGeminiKeys}
-            activeProvider={activeAiProvider}
-            selectedFileIds={selectedFileIds}
-            onToggleSelectFile={handleToggleSelectFile}
-            onToggleSelectAllFiles={handleToggleSelectAllFiles}
-            concurrentFilesCount={concurrentFilesCount}
-            setConcurrentFilesCount={setConcurrentFilesCount}
-            onAssignFileKey={handleAssignFileKey}
-            onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
-            onRetranslateFolder={handleRetranslateFolder}
-            onCompleteMissingFolder={handleCompleteMissingFolder}
-            onUpgradeFolderTiming={handleUpgradeFolderTiming}
-            onUpgradeAllFoldersTiming={handleUpgradeAllFoldersTiming}
-            onResyncFolderTimings={handleResyncFolderTimings}
-            onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
-            onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
-            targetLanguage={targetLanguage}
-            onExportFullBackup={handleExportFullBackup}
-            onImportFullBackup={handleImportFullBackup}
-            selectedEncoding={selectedEncoding}
-            setSelectedEncoding={setSelectedEncoding}
-            uiLang={uiLang}
-            onCreateFolder={handleCreateFolder}
-            onRenameFolder={handleRenameFolder}
-            onDeleteFolder={handleDeleteFolder}
-            onSelectFolder={handleSelectFolder}
-            onAddFilesToFolder={handleAddFilesToFolder}
-            onUploadSystemDirectory={handleUploadSystemDirectory}
-            onRemoveFileFromFolder={handleRemoveFileFromFolder}
-            onSelectFile={handleSelectFolderFile}
-            onEnterTranslationView={handleEnterTranslationView}
-            onExitTranslationView={() => setInTranslationView(false)}
-            onBatchExportFolder={handleBatchExportFolder}
-            onLoadSampleToFolder={handleLoadSampleToFolder}
-          />
+          <>
+            {isTranslating && (
+              <TranslationProgress
+                currentBatch={currentBatch}
+                totalBatches={totalBatches}
+                translatedLines={translatedCount}
+                totalLines={progressTotalLines ?? items.length}
+                isPaused={isPaused}
+                retryInfo={retryInfo}
+                onPauseToggle={() => setIsPaused(!isPaused)}
+                onCancel={handleCancelActiveJob}
+                uiLang={uiLang}
+                selectedModel={activeRunningModel || (activeAiProvider === 'custom' ? (customProviderConfig.model || 'Custom Model') : selectedModel)}
+                activeProvider={activeAiProvider}
+                customProviderConfig={customProviderConfig}
+                isFallbackActive={isFallbackActive}
+                rateLimitPacing={rateLimitPacing}
+                pacingRemainingSec={pacingRemainingSec}
+                activeWorkerCount={Math.max(1, translatingFileIds.length)}
+                activeKeyLabels={Object.values(fileKeyUsageMap)}
+              />
+            )}
+            <FolderWorkspace
+              folders={folders}
+              activeFolder={activeFolder}
+              activeFileId={activeFileId}
+              inTranslationView={false}
+              isTranslating={isTranslating}
+              translatingFileId={translatingFileId}
+              translatingFileIds={translatingFileIds}
+              fileKeyUsageMap={fileKeyUsageMap}
+              savedGeminiKeys={savedGeminiKeys}
+              activeProvider={activeAiProvider}
+              selectedFileIds={selectedFileIds}
+              onToggleSelectFile={handleToggleSelectFile}
+              onToggleSelectAllFiles={handleToggleSelectAllFiles}
+              concurrentFilesCount={concurrentFilesCount}
+              setConcurrentFilesCount={setConcurrentFilesCount}
+              onAssignFileKey={handleAssignFileKey}
+              onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
+              onRetranslateFolder={handleRetranslateFolder}
+              onCompleteMissingFolder={handleCompleteMissingFolder}
+              onAuditAndFixFolder={handleAuditAndFixFolder}
+              onAuditAndFixAllFolders={handleAuditAndFixAllFolders}
+              onCancelOperation={handleCancelActiveJob}
+              onResyncFolderTimings={handleResyncFolderTimings}
+              onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
+              onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
+              targetLanguage={targetLanguage}
+              onExportFullBackup={handleExportFullBackup}
+              onImportFullBackup={handleImportFullBackup}
+              selectedEncoding={selectedEncoding}
+              setSelectedEncoding={setSelectedEncoding}
+              uiLang={uiLang}
+              onCreateFolder={handleCreateFolder}
+              onRenameFolder={handleRenameFolder}
+              onDeleteFolder={handleDeleteFolder}
+              onSelectFolder={handleSelectFolder}
+              onAddFilesToFolder={handleAddFilesToFolder}
+              onUploadSystemDirectory={handleUploadSystemDirectory}
+              onRemoveFileFromFolder={handleRemoveFileFromFolder}
+              onSelectFile={handleSelectFolderFile}
+              onEnterTranslationView={handleEnterTranslationView}
+              onExitTranslationView={() => setInTranslationView(false)}
+              onBatchExportFolder={handleBatchExportFolder}
+              onLoadSampleToFolder={handleLoadSampleToFolder}
+            />
+          </>
         ) : (
           <>
             {/* Cinema Mode Compact Folder Bar + Fast SRT/VTT Batch Export */}
@@ -3659,8 +4140,9 @@ export default function App() {
                 onTranslateConcurrentFiles={(fileIds) => void handleTranslateFilesConcurrently(fileIds)}
                 onRetranslateFolder={handleRetranslateFolder}
                 onCompleteMissingFolder={handleCompleteMissingFolder}
-                onUpgradeFolderTiming={handleUpgradeFolderTiming}
-                onUpgradeAllFoldersTiming={handleUpgradeAllFoldersTiming}
+                onAuditAndFixFolder={handleAuditAndFixFolder}
+                onAuditAndFixAllFolders={handleAuditAndFixAllFolders}
+                onCancelOperation={handleCancelActiveJob}
                 onResyncFolderTimings={handleResyncFolderTimings}
                 onBatchExportCompletedFiles={handleBatchExportCompletedFiles}
                 onClearCompletedFilesBatch={handleClearCompletedFilesBatch}
@@ -3756,27 +4238,7 @@ export default function App() {
                 isPaused={isPaused}
                 retryInfo={retryInfo}
                 onPauseToggle={() => setIsPaused(!isPaused)}
-                onCancel={() => {
-                  cancelTranslationRef.current = true;
-                  isTranslatingRef.current = false;
-                  activeJobIdRef.current = '';
-                  if (activeAbortControllerRef.current) {
-                    try { activeAbortControllerRef.current.abort(); } catch {}
-                    activeAbortControllerRef.current = null;
-                  }
-                  folderAbortControllersRef.current.forEach((ctrl) => {
-                    try { ctrl.abort(); } catch {}
-                  });
-                  folderAbortControllersRef.current.clear();
-                  translatingFileIdsRef.current = [];
-                  setTranslatingFileIds([]);
-                  setFileKeyUsageMap({});
-                  setTranslatingFileId(null);
-                  setProgressTotalLines(null);
-                  setPacingRemainingSec(null);
-                  setRetryInfo(null);
-                  setIsTranslating(false);
-                }}
+                onCancel={handleCancelActiveJob}
                 uiLang={uiLang}
                 selectedModel={activeRunningModel || (activeAiProvider === 'custom' ? (customProviderConfig.model || 'Custom Model') : selectedModel)}
                 activeProvider={activeAiProvider}

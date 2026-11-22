@@ -2024,6 +2024,314 @@ AUDIT RULES:
   }
 });
 
+// API Endpoint: Ultra-Fast Diff-Only Subtitle Alignment & Text-Shift Audit/Repair
+// Checks a window of { id, en, fa } pairs for cue-merge shifts, off-by-one timing drifts,
+// and missing/untranslated lines. Returns ONLY changed IDs (when aligned, outputs ~10 tokens!).
+app.post('/api/realign-subtitles', aiRateLimiter, async (req, res) => {
+  const requestId = 'realign_' + Date.now().toString(36) + '_' + Math.random().toString(36).substring(2, 6);
+  const clientAbortController = attachClientAbort(res);
+
+  try {
+    const { items, targetLanguage, tone, customPrompt, model, provider, customProvider } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'آیتمی برای بررسی متن ارسال نشده است.',
+        errorType: 'invalid_config',
+        retryable: false,
+        requestId,
+      });
+    }
+
+    const effectiveTargetLang = String(targetLanguage || 'fa').trim();
+    const toneDescription = (tone && (TONE_PROMPTS as any)[tone]) || TONE_PROMPTS.cinematic;
+    const userCustomPrompt = customPrompt?.trim() || '';
+
+    const compactItems = items.map((it: any) => ({
+      id: Number(it.id),
+      en: String(it.en ?? it.originalText ?? ''),
+      fa: String(it.fa ?? it.translatedText ?? ''),
+    }));
+    const allowedIdSet = new Set<number>(compactItems.map((it) => it.id));
+
+    const systemInstruction = `You are a Subtitle Timing & Text-Alignment Surgeon for movies/TV (${effectiveTargetLang}).
+Each input item has:
+- "id": immutable video cue index locked to an exact timestamp
+- "en": exact English spoken line at that timestamp
+- "fa": current translation stored at that timestamp
+
+YOUR MISSION (DIFF-ONLY, ZERO UNNECESSARY REWRITES):
+1. Inspect EVERY item in order to check if "fa" accurately matches ONLY its own "en" at that exact "id".
+2. DETECT & FIX THESE 3 PROBLEMS:
+   a) CUE SHIFT / MERGE DRIFT: If an earlier pass merged two English cues into one "fa" and shifted later translations 1-2 cues early or late (so cue N's "fa" actually translates cue N+1 or N-1), slide/re-align the existing translations back onto their EXACT true "id"s and split/translate any merged portion so EVERY "id" matches ONLY its own "en" 1:1.
+   b) MISSING / UNTRANSLATED LINES: If "en" has spoken words but "fa" is empty or still untranslated in English, translate it cleanly into ${effectiveTargetLang}.
+   c) BROKEN FORMATTING: Never output timestamps, cue numbers, "-->", or blank lines (\\n\\n) inside "text". Preserve tags (<i>, <b>) and variables ({0}, %s).
+3. DIFF-ONLY SPEED RULE:
+   - If an item's "fa" ALREADY accurately translates its own "en" at that exact "id", DO NOT include that "id" in "fixes"! Keep good translations untouched.
+   - If ALL items in this window are already properly aligned 1:1 and translated, return: {"allAligned": true, "fixes": []}.
+4. TONE & FIDELITY:
+   - Tone: ${toneDescription}
+   ${userCustomPrompt ? `- Custom Instruction: "${userCustomPrompt}"` : ''}
+   - When tone is 'expose', 'humorous', 'conversational', or 'epic', preserve uncensored natural fidelity with zero softening.
+5. STRICT JSON OUTPUT:
+   Return ONLY valid JSON:
+   {
+     "allAligned": true | false,
+     "fixes": [
+       { "id": 12, "text": "..." }
+     ]
+   }`;
+
+    const promptText = `Audit alignment & fix ONLY shifted, merged, or untranslated lines in these ${compactItems.length} cues:\n` +
+      JSON.stringify(compactItems);
+
+    const validateAndExtractFixes = (parsed: any): { allAligned: boolean; fixes: Array<{ id: number; text: string }> } => {
+      if (!parsed || typeof parsed !== 'object') {
+        const err: any = new Error('Malformed alignment JSON response.');
+        err.errorType = 'malformed_json';
+        err.status = 502;
+        err.retryable = true;
+        throw err;
+      }
+
+      const rawFixes = Array.isArray(parsed.fixes) ? parsed.fixes : [];
+      const seenIds = new Set<number>();
+      const validFixes: Array<{ id: number; text: string }> = [];
+
+      for (const f of rawFixes) {
+        if (!f || (typeof f.id !== 'number' && typeof f.id !== 'string')) continue;
+        const numId = Number(f.id);
+        if (!Number.isInteger(numId) || !allowedIdSet.has(numId)) {
+          const idErr: any = new Error(`Alignment response returned unexpected cue id ${numId}.`);
+          idErr.errorType = 'id_alignment_mismatch';
+          idErr.status = 502;
+          idErr.retryable = true;
+          throw idErr;
+        }
+        if (seenIds.has(numId)) {
+          const dupErr: any = new Error(`Alignment response returned duplicate cue id ${numId}.`);
+          dupErr.errorType = 'id_alignment_mismatch';
+          dupErr.status = 502;
+          dupErr.retryable = true;
+          throw dupErr;
+        }
+        seenIds.add(numId);
+
+        const cleaned = stripAccidentalTimestamps(String(f.text ?? ''));
+        const origItem = compactItems.find((ci) => ci.id === numId);
+        // Never overwrite a non-empty cue with an empty fix
+        if (origItem && origItem.en.trim().length > 0 && cleaned.trim().length === 0) {
+          continue;
+        }
+        validFixes.push({ id: numId, text: cleaned });
+      }
+
+      return {
+        allAligned: Boolean(parsed.allAligned) && validFixes.length === 0,
+        fixes: validFixes,
+      };
+    };
+
+    if (provider === 'custom') {
+      if (!customProvider) {
+        return res.status(400).json({
+          success: false,
+          error: 'Custom Provider configuration is missing.',
+          errorType: 'invalid_config',
+          retryable: false,
+          requestId,
+        });
+      }
+      const validation = validateCustomProviderConfig(customProvider);
+      if (!validation.valid) {
+        return res.status(400).json({
+          success: false,
+          error: validation.error || 'Invalid Custom Provider config.',
+          errorType: 'invalid_config',
+          retryable: false,
+          requestId,
+        });
+      }
+
+      const targetUrl = buildChatCompletionsUrl(customProvider.baseUrl);
+      const DEADLINE_MS = 240000;
+      const deadlineController = new AbortController();
+      const deadlineTimer = setTimeout(() => deadlineController.abort(new Error('CUSTOM_PROVIDER_TIMEOUT')), DEADLINE_MS);
+      const combinedSignal = AbortSignal.any([deadlineController.signal, clientAbortController.signal]);
+      let releaseLock: (() => void) | null = null;
+
+      try {
+        releaseLock = await customProviderLimiter.acquire();
+        const resp = await fetch(targetUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${customProvider.apiKey.trim()}`,
+          },
+          body: JSON.stringify({
+            model: customProvider.model.trim(),
+            messages: [
+              { role: 'system', content: systemInstruction },
+              { role: 'user', content: promptText },
+            ],
+            temperature: 0.15,
+          }),
+          signal: combinedSignal,
+          redirect: 'error',
+        });
+
+        clearTimeout(deadlineTimer);
+        if (!resp.ok) {
+          const errText = await resp.text().catch(() => '');
+          const errJson = extractJsonFromText(errText);
+          const rawMsg = errJson?.error?.message || errJson?.message || errText || `HTTP ${resp.status}`;
+          const classified = classifyCustomProviderError(new Error(sanitizeErrorMessage(rawMsg, customProvider.apiKey)), resp.status);
+          return res.status(classified.status).json({
+            success: false,
+            error: classified.message,
+            errorType: classified.errorType,
+            retryable: classified.retryable,
+            requestId,
+          });
+        }
+
+        const respJson: any = await resp.json();
+        const content = respJson?.choices?.[0]?.message?.content || respJson?.choices?.[0]?.text || '';
+        const parsed = extractJsonFromText(content);
+        const extracted = validateAndExtractFixes(parsed);
+
+        return res.json({
+          success: true,
+          allAligned: extracted.allAligned,
+          fixes: extracted.fixes,
+          modelUsed: customProvider.model.trim(),
+          isFallback: false,
+          requestId,
+        });
+      } catch (cErr: any) {
+        clearTimeout(deadlineTimer);
+        if (clientAbortController.signal.aborted) {
+          return res.end();
+        }
+        const classified = classifyCustomProviderError(cErr, cErr?.status);
+        return res.status(classified.status).json({
+          success: false,
+          error: classified.message,
+          errorType: classified.errorType,
+          retryable: classified.retryable,
+          requestId,
+        });
+      } finally {
+        clearTimeout(deadlineTimer);
+        if (releaseLock) releaseLock();
+      }
+    } else {
+      // Gemini Provider with Key Pool Failover & Full Telemetry
+      const apiKeys = getClientKeysFromHeader(req);
+      const { response, modelUsed, isFallback, keyIndexUsed, exhaustedKeyIndices, invalidKeyIndices } =
+        await callGeminiWithRetryAndFallback(
+          apiKeys,
+          {
+            contents: promptText,
+            config: {
+              systemInstruction,
+              responseMimeType: 'application/json',
+              temperature: 0.15,
+              safetySettings: [
+                { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+                { category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY, threshold: HarmBlockThreshold.BLOCK_NONE },
+              ],
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  allAligned: { type: Type.BOOLEAN },
+                  fixes: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        id: { type: Type.INTEGER },
+                        text: { type: Type.STRING },
+                      },
+                      required: ['id', 'text'],
+                    },
+                  },
+                },
+                required: ['allAligned', 'fixes'],
+              },
+            },
+          },
+          model,
+          clientAbortController.signal
+        );
+
+      let parsed: any = null;
+      try {
+        parsed = JSON.parse(response.text || '{}');
+      } catch {
+        return res.status(502).json({
+          success: false,
+          error: 'خطا در قالب‌بندی پاسخ بررسی متن. در حال تلاش مجدد...',
+          errorType: 'malformed_json',
+          retryable: true,
+          keyIndexUsed,
+          exhaustedKeyIndices,
+          invalidKeyIndices,
+          requestId,
+        });
+      }
+
+      const extracted = validateAndExtractFixes(parsed);
+      return res.json({
+        success: true,
+        allAligned: extracted.allAligned,
+        fixes: extracted.fixes,
+        modelUsed,
+        isFallback,
+        keyIndexUsed,
+        exhaustedKeyIndices,
+        invalidKeyIndices,
+        requestId,
+      });
+    }
+  } catch (err: any) {
+    if (err?.isClientAbort || err?.message?.startsWith('CLIENT_ABORTED') || clientAbortController.signal.aborted) {
+      return res.end();
+    }
+    const status = err?.status && typeof err.status === 'number' ? err.status : 500;
+    const message = err instanceof Error ? err.message : 'خطا در بررسی هم‌ترازی متن زیرنویس';
+    const exhaustedKeyIndices = Array.isArray(err?.exhaustedKeyIndices) ? err.exhaustedKeyIndices : [];
+    const invalidKeyIndices = Array.isArray(err?.invalidKeyIndices) ? err.invalidKeyIndices : [];
+
+    if (message.includes('کلید API جمینای تنظیم نشده')) {
+      return res.status(400).json({
+        success: false,
+        error: message,
+        errorType: 'invalid_config',
+        retryable: false,
+        requestId,
+      });
+    }
+
+    const isRateLimit = message.includes('429') || message.toLowerCase().includes('quota') || message.toLowerCase().includes('resource_exhausted');
+    const isAuthError = message.includes('401') || message.includes('403') || message.toLowerCase().includes('api_key_invalid');
+
+    return res.status(isRateLimit ? 429 : isAuthError ? 401 : status).json({
+      success: false,
+      error: message,
+      errorType: err?.errorType || (isRateLimit ? 'rate_limit' : isAuthError ? 'auth_failure' : 'provider_error'),
+      retryable: err?.retryable !== undefined ? Boolean(err.retryable) : !isAuthError,
+      exhaustedKeyIndices,
+      invalidKeyIndices,
+      requestId,
+    });
+  }
+});
+
 // API Endpoint: Detect source language of text sample
 // FIX (B1): protected by the per-IP AI rate limiter
 app.post('/api/detect-language', aiRateLimiter, async (req, res) => {

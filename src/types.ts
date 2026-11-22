@@ -295,6 +295,9 @@ export interface SubtitleFolderFile {
   assignedKeyId?: string;
   timingUpgradedAt?: number;
   suspectedShiftCuesCount?: number;
+  textAuditStatus?: 'unchecked' | 'verified';
+  textAuditCheckedAt?: number;
+  textAuditFixedCount?: number;
 }
 
 export interface SubtitleFolder {
